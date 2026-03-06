@@ -369,6 +369,14 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
+	if auth.Quarantined {
+		return true, blockReasonDisabled, time.Time{}
+	}
+	if !auth.TempDisabledUntil.IsZero() {
+		if auth.TempDisabledUntil.After(now) {
+			return true, blockReasonCooldown, auth.TempDisabledUntil
+		}
+	}
 	if model != "" {
 		if len(auth.ModelStates) > 0 {
 			state, ok := auth.ModelStates[model]

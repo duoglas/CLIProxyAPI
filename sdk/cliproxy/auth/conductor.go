@@ -65,6 +65,7 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+	authGuardWindow       = 24 * time.Hour
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1239,6 +1240,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	if result.AuthID == "" {
 		return
 	}
+	authGuardCfg := m.currentAuthGuardConfig()
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
@@ -1249,8 +1251,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
 		now := time.Now()
+		updateAuthGuardWindow(auth, result.Success, now, authGuardWindow)
 
 		if result.Success {
+			auth.ConsecutiveFailures = 0
+			auth.TempDisabledUntil = time.Time{}
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
 				resetModelState(state, now)
@@ -1267,73 +1272,78 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				clearAuthStateOnSuccess(auth, now)
 			}
 		} else {
-			if result.Model != "" {
-				state := ensureModelState(auth, result.Model)
-				state.Unavailable = true
-				state.Status = StatusError
-				state.UpdatedAt = now
-				if result.Error != nil {
-					state.LastError = cloneError(result.Error)
-					state.StatusMessage = result.Error.Message
-					auth.LastError = cloneError(result.Error)
-					auth.StatusMessage = result.Error.Message
-				}
-
-				statusCode := statusCodeFromResult(result.Error)
-				switch statusCode {
-				case 401:
-					next := now.Add(30 * time.Minute)
-					state.NextRetryAfter = next
-					suspendReason = "unauthorized"
-					shouldSuspendModel = true
-				case 402, 403:
-					next := now.Add(30 * time.Minute)
-					state.NextRetryAfter = next
-					suspendReason = "payment_required"
-					shouldSuspendModel = true
-				case 404:
-					next := now.Add(12 * time.Hour)
-					state.NextRetryAfter = next
-					suspendReason = "not_found"
-					shouldSuspendModel = true
-				case 429:
-					var next time.Time
-					backoffLevel := state.Quota.BackoffLevel
-					if result.RetryAfter != nil {
-						next = now.Add(*result.RetryAfter)
-					} else {
-						cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
-						if cooldown > 0 {
-							next = now.Add(cooldown)
-						}
-						backoffLevel = nextLevel
-					}
-					state.NextRetryAfter = next
-					state.Quota = QuotaState{
-						Exceeded:      true,
-						Reason:        "quota",
-						NextRecoverAt: next,
-						BackoffLevel:  backoffLevel,
-					}
-					suspendReason = "quota"
-					shouldSuspendModel = true
-					setModelQuota = true
-				case 408, 500, 502, 503, 504:
-					if quotaCooldownDisabledForAuth(auth) {
-						state.NextRetryAfter = time.Time{}
-					} else {
-						next := now.Add(1 * time.Minute)
-						state.NextRetryAfter = next
-					}
-				default:
-					state.NextRetryAfter = time.Time{}
-				}
-
-				auth.Status = StatusError
+			hardFailed := applyAuthGuardFailureState(auth, authGuardCfg, result.Error, now)
+			if hardFailed {
 				auth.UpdatedAt = now
-				updateAggregatedAvailability(auth, now)
 			} else {
-				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
+				if result.Model != "" {
+					state := ensureModelState(auth, result.Model)
+					state.Unavailable = true
+					state.Status = StatusError
+					state.UpdatedAt = now
+					if result.Error != nil {
+						state.LastError = cloneError(result.Error)
+						state.StatusMessage = result.Error.Message
+						auth.LastError = cloneError(result.Error)
+						auth.StatusMessage = result.Error.Message
+					}
+
+					statusCode := statusCodeFromResult(result.Error)
+					switch statusCode {
+					case 401:
+						next := now.Add(30 * time.Minute)
+						state.NextRetryAfter = next
+						suspendReason = "unauthorized"
+						shouldSuspendModel = true
+					case 402, 403:
+						next := now.Add(30 * time.Minute)
+						state.NextRetryAfter = next
+						suspendReason = "payment_required"
+						shouldSuspendModel = true
+					case 404:
+						next := now.Add(12 * time.Hour)
+						state.NextRetryAfter = next
+						suspendReason = "not_found"
+						shouldSuspendModel = true
+					case 429:
+						var next time.Time
+						backoffLevel := state.Quota.BackoffLevel
+						if result.RetryAfter != nil {
+							next = now.Add(*result.RetryAfter)
+						} else {
+							cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
+							if cooldown > 0 {
+								next = now.Add(cooldown)
+							}
+							backoffLevel = nextLevel
+						}
+						state.NextRetryAfter = next
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "quota",
+							NextRecoverAt: next,
+							BackoffLevel:  backoffLevel,
+						}
+						suspendReason = "quota"
+						shouldSuspendModel = true
+						setModelQuota = true
+					case 408, 500, 502, 503, 504:
+						if quotaCooldownDisabledForAuth(auth) {
+							state.NextRetryAfter = time.Time{}
+						} else {
+							next := now.Add(1 * time.Minute)
+							state.NextRetryAfter = next
+						}
+					default:
+						state.NextRetryAfter = time.Time{}
+					}
+
+					auth.Status = StatusError
+					auth.UpdatedAt = now
+					updateAggregatedAvailability(auth, now)
+				} else {
+					applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
+				}
 			}
 		}
 
@@ -1545,6 +1555,98 @@ func isRequestInvalidError(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "invalid_request_error")
+}
+
+func (m *Manager) currentAuthGuardConfig() internalconfig.AuthGuardConfig {
+	if m == nil {
+		return internalconfig.AuthGuardConfig{}
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return internalconfig.AuthGuardConfig{}
+	}
+	return cfg.AuthGuard
+}
+
+func applyAuthGuardFailureState(auth *Auth, guardCfg internalconfig.AuthGuardConfig, resultErr *Error, now time.Time) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Disabled || auth.Quarantined {
+		return true
+	}
+	if isHardFailure(resultErr, guardCfg.HardFailurePatterns) {
+		auth.Disabled = true
+		auth.Quarantined = true
+		auth.Status = StatusDisabled
+		auth.Unavailable = true
+		auth.ConsecutiveFailures = 0
+		auth.TempDisabledUntil = time.Time{}
+		auth.NextRetryAfter = time.Time{}
+		auth.UpdatedAt = now
+		if resultErr != nil {
+			auth.LastError = cloneError(resultErr)
+			auth.StatusMessage = resultErr.Message
+		}
+		return true
+	}
+	auth.ConsecutiveFailures++
+	if guardCfg.FailureThreshold <= 0 || auth.ConsecutiveFailures < guardCfg.FailureThreshold {
+		return false
+	}
+	if guardCfg.TempDisableMinutes <= 0 {
+		return false
+	}
+	until := now.Add(time.Duration(guardCfg.TempDisableMinutes) * time.Minute)
+	if auth.TempDisabledUntil.Before(until) {
+		auth.TempDisabledUntil = until
+	}
+	if auth.NextRetryAfter.Before(until) {
+		auth.NextRetryAfter = until
+	}
+	return false
+}
+
+func isHardFailure(resultErr *Error, patterns []string) bool {
+	if resultErr == nil || len(patterns) == 0 {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(resultErr.Message))
+	code := strings.ToLower(strings.TrimSpace(resultErr.Code))
+	if msg == "" && code == "" {
+		return false
+	}
+	for i := range patterns {
+		pattern := strings.ToLower(strings.TrimSpace(patterns[i]))
+		if pattern == "" {
+			continue
+		}
+		if strings.Contains(msg, pattern) || strings.Contains(code, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func updateAuthGuardWindow(auth *Auth, success bool, now time.Time, window time.Duration) {
+	if auth == nil {
+		return
+	}
+	if window <= 0 {
+		window = 24 * time.Hour
+	}
+	if auth.GuardWindowStartedAt.IsZero() || now.Sub(auth.GuardWindowStartedAt) >= window {
+		auth.GuardWindowStartedAt = now
+		auth.GuardWindowSuccesses = 0
+		auth.GuardWindowFailures = 0
+	}
+	if success {
+		auth.GuardWindowSuccesses++
+		auth.LastSuccessAt = now
+		return
+	}
+	auth.GuardWindowFailures++
+	auth.LastFailureAt = now
 }
 
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
