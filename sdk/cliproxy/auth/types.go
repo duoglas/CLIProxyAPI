@@ -87,7 +87,15 @@ type Auth struct {
 	// NextRetryAfter is the earliest time a retry should retrigger.
 	NextRetryAfter time.Time `json:"next_retry_after"`
 	// ModelStates tracks per-model runtime availability data.
-	ModelStates map[string]*ModelState `json:"model_states,omitempty"`
+	ModelStates          map[string]*ModelState `json:"model_states,omitempty"`
+	ConsecutiveFailures  int                    `json:"consecutive_failures,omitempty"`
+	TempDisabledUntil    time.Time              `json:"temp_disabled_until,omitempty"`
+	Quarantined          bool                   `json:"quarantined,omitempty"`
+	GuardWindowStartedAt time.Time              `json:"guard_window_started_at,omitempty"`
+	GuardWindowSuccesses int                    `json:"guard_window_successes,omitempty"`
+	GuardWindowFailures  int                    `json:"guard_window_failures,omitempty"`
+	LastSuccessAt        time.Time              `json:"last_success_at,omitempty"`
+	LastFailureAt        time.Time              `json:"last_failure_at,omitempty"`
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`

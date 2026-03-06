@@ -358,19 +358,30 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		name = auth.ID
 	}
 	entry := gin.H{
-		"id":             auth.ID,
-		"auth_index":     auth.Index,
-		"name":           name,
-		"type":           strings.TrimSpace(auth.Provider),
-		"provider":       strings.TrimSpace(auth.Provider),
-		"label":          auth.Label,
-		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
-		"disabled":       auth.Disabled,
-		"unavailable":    auth.Unavailable,
-		"runtime_only":   runtimeOnly,
-		"source":         "memory",
-		"size":           int64(0),
+		"id":                   auth.ID,
+		"auth_index":           auth.Index,
+		"name":                 name,
+		"type":                 strings.TrimSpace(auth.Provider),
+		"provider":             strings.TrimSpace(auth.Provider),
+		"label":                auth.Label,
+		"status":               auth.Status,
+		"status_message":       auth.StatusMessage,
+		"disabled":             auth.Disabled,
+		"unavailable":          auth.Unavailable,
+		"runtime_only":         runtimeOnly,
+		"source":               "memory",
+		"size":                 int64(0),
+		"quarantined":          auth.Quarantined,
+		"consecutive_failures": auth.ConsecutiveFailures,
+	}
+	if !auth.TempDisabledUntil.IsZero() {
+		entry["temp_disabled_until"] = auth.TempDisabledUntil
+	}
+	if !auth.GuardWindowStartedAt.IsZero() {
+		entry["guard_window_started_at"] = auth.GuardWindowStartedAt
+		entry["guard_window_successes"] = auth.GuardWindowSuccesses
+		entry["guard_window_failures"] = auth.GuardWindowFailures
+		entry["cleanup_candidate"] = isCleanupCandidate(auth, time.Now(), 24*time.Hour)
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email

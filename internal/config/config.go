@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	DefaultPanelGitHubRepository = "https://github.com/duoglas/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
 )
 
@@ -77,6 +77,8 @@ type Config struct {
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
+
+	AuthGuard AuthGuardConfig `yaml:"auth-guard" json:"auth-guard"`
 
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
@@ -172,6 +174,17 @@ type QuotaExceeded struct {
 
 	// SwitchPreviewModel indicates whether to automatically switch to a preview model when a quota is exceeded.
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
+}
+
+type AuthGlobalFailureProtectConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+}
+
+type AuthGuardConfig struct {
+	FailureThreshold     int                            `yaml:"failure-threshold" json:"failure-threshold"`
+	TempDisableMinutes   int                            `yaml:"temp-disable-minutes" json:"temp-disable-minutes"`
+	HardFailurePatterns  []string                       `yaml:"hard-failure-patterns" json:"hard-failure-patterns"`
+	GlobalFailureProtect AuthGlobalFailureProtectConfig `yaml:"global-failure-protect" json:"global-failure-protect"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -546,6 +559,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.AuthGuard.FailureThreshold = 5
+	cfg.AuthGuard.TempDisableMinutes = 30
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.
@@ -606,6 +621,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.MaxRetryCredentials = 0
 	}
 
+	cfg.SanitizeAuthGuard()
+
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()
 
@@ -656,6 +673,40 @@ func (cfg *Config) SanitizePayloadRules() {
 	}
 	cfg.Payload.DefaultRaw = sanitizePayloadRawRules(cfg.Payload.DefaultRaw, "default-raw")
 	cfg.Payload.OverrideRaw = sanitizePayloadRawRules(cfg.Payload.OverrideRaw, "override-raw")
+}
+
+func (cfg *Config) SanitizeAuthGuard() {
+	if cfg == nil {
+		return
+	}
+	if cfg.AuthGuard.FailureThreshold < 0 {
+		cfg.AuthGuard.FailureThreshold = 0
+	}
+	if cfg.AuthGuard.TempDisableMinutes < 0 {
+		cfg.AuthGuard.TempDisableMinutes = 0
+	}
+	if len(cfg.AuthGuard.HardFailurePatterns) == 0 {
+		cfg.AuthGuard.HardFailurePatterns = nil
+		return
+	}
+	seen := make(map[string]struct{}, len(cfg.AuthGuard.HardFailurePatterns))
+	out := make([]string, 0, len(cfg.AuthGuard.HardFailurePatterns))
+	for i := range cfg.AuthGuard.HardFailurePatterns {
+		pattern := strings.ToLower(strings.TrimSpace(cfg.AuthGuard.HardFailurePatterns[i]))
+		if pattern == "" {
+			continue
+		}
+		if _, exists := seen[pattern]; exists {
+			continue
+		}
+		seen[pattern] = struct{}{}
+		out = append(out, pattern)
+	}
+	if len(out) == 0 {
+		cfg.AuthGuard.HardFailurePatterns = nil
+		return
+	}
+	cfg.AuthGuard.HardFailurePatterns = out
 }
 
 func sanitizePayloadRawRules(rules []PayloadRule, section string) []PayloadRule {

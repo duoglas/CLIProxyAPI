@@ -311,6 +311,55 @@ func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsNotBlocked(t *testin
 	}
 }
 
+func TestIsAuthBlockedForModel_GuardState(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+
+	t.Run("quarantined", func(t *testing.T) {
+		auth := &Auth{ID: "a", Quarantined: true}
+		blocked, reason, next := isAuthBlockedForModel(auth, "", now)
+		if !blocked {
+			t.Fatalf("blocked = false, want true")
+		}
+		if reason != blockReasonDisabled {
+			t.Fatalf("reason = %v, want %v", reason, blockReasonDisabled)
+		}
+		if !next.IsZero() {
+			t.Fatalf("next = %v, want zero", next)
+		}
+	})
+
+	t.Run("temp disabled in future", func(t *testing.T) {
+		until := now.Add(10 * time.Minute)
+		auth := &Auth{ID: "b", TempDisabledUntil: until}
+		blocked, reason, next := isAuthBlockedForModel(auth, "", now)
+		if !blocked {
+			t.Fatalf("blocked = false, want true")
+		}
+		if reason != blockReasonCooldown {
+			t.Fatalf("reason = %v, want %v", reason, blockReasonCooldown)
+		}
+		if next.IsZero() || !next.Equal(until) {
+			t.Fatalf("next = %v, want %v", next, until)
+		}
+	})
+
+	t.Run("temp disabled expired", func(t *testing.T) {
+		auth := &Auth{ID: "c", TempDisabledUntil: now.Add(-1 * time.Second)}
+		blocked, reason, next := isAuthBlockedForModel(auth, "", now)
+		if blocked {
+			t.Fatalf("blocked = true, want false")
+		}
+		if reason != blockReasonNone {
+			t.Fatalf("reason = %v, want %v", reason, blockReasonNone)
+		}
+		if !next.IsZero() {
+			t.Fatalf("next = %v, want zero", next)
+		}
+	})
+}
+
 func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testing.T) {
 	t.Parallel()
 

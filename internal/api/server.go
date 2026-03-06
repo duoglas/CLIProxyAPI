@@ -621,6 +621,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
 
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
+		mgmt.GET("/auths/health", s.mgmt.GetAuthsHealth)
+		mgmt.POST("/auths/cleanup", s.mgmt.CleanupAuths)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
@@ -640,6 +642,14 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/iflow-auth-url", s.mgmt.RequestIFlowCookieToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
+	}
+
+	admin := s.engine.Group("/admin")
+	admin.Use(s.managementAvailabilityMiddleware(), s.mgmt.Middleware())
+	{
+		auths := admin.Group("/auths")
+		auths.GET("/health", s.mgmt.GetAuthsHealth)
+		auths.POST("/cleanup", s.mgmt.CleanupAuths)
 	}
 }
 
