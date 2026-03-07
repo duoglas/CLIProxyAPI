@@ -177,7 +177,7 @@ func isCleanupCandidate(auth *coreauth.Auth, now time.Time, window time.Duration
 	if auth == nil {
 		return false
 	}
-	if auth.GuardWindowFailures <= 0 || auth.GuardWindowSuccesses != 0 {
+	if auth.GuardWindowSuccesses != 0 || auth.GuardWindowFailures <= 3 {
 		return false
 	}
 	if auth.GuardWindowStartedAt.IsZero() {

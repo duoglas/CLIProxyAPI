@@ -46,6 +46,19 @@ func TestGetAuthsHealth_ReturnsCleanupCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register auth-ok: %v", err)
 	}
+	_, err = manager.Register(context.Background(), &coreauth.Auth{
+		ID:                   "auth-three-fails",
+		FileName:             "auth-three-fails.json",
+		Provider:             "codex",
+		Status:               coreauth.StatusError,
+		GuardWindowStartedAt: now.Add(-2 * time.Hour),
+		GuardWindowFailures:  3,
+		GuardWindowSuccesses: 0,
+		Metadata:             map[string]any{"type": "codex"},
+	})
+	if err != nil {
+		t.Fatalf("register auth-three-fails: %v", err)
+	}
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: t.TempDir()}, manager)
 	rec := httptest.NewRecorder()
