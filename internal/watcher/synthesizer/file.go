@@ -93,6 +93,7 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 		}
 
 		disabled, _ := metadata["disabled"].(bool)
+		quarantined, _ := metadata["quarantined"].(bool)
 		status := coreauth.StatusActive
 		if disabled {
 			status = coreauth.StatusDisabled
@@ -102,12 +103,13 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 		perAccountExcluded := extractExcludedModelsFromMetadata(metadata)
 
 		a := &coreauth.Auth{
-			ID:       id,
-			Provider: provider,
-			Label:    label,
-			Prefix:   prefix,
-			Status:   status,
-			Disabled: disabled,
+			ID:          id,
+			Provider:    provider,
+			Label:       label,
+			Prefix:      prefix,
+			Status:      status,
+			Disabled:    disabled,
+			Quarantined: quarantined,
 			Attributes: map[string]string{
 				"source": full,
 				"path":   full,

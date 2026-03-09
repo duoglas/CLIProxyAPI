@@ -1,6 +1,8 @@
 package management
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -76,10 +78,12 @@ func (h *Handler) CleanupAuths(c *gin.Context) {
 		return
 	}
 	req := authCleanupRequest{}
-	if c.Request.ContentLength > 0 {
+	if c.Request.Body != nil {
 		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-			return
+			if !errors.Is(err, io.EOF) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+				return
+			}
 		}
 	}
 	windowHours := 24
@@ -177,7 +181,7 @@ func isCleanupCandidate(auth *coreauth.Auth, now time.Time, window time.Duration
 	if auth == nil {
 		return false
 	}
-	if auth.GuardWindowFailures <= 0 || auth.GuardWindowSuccesses != 0 {
+	if auth.GuardWindowSuccesses != 0 || auth.GuardWindowFailures <= 3 {
 		return false
 	}
 	if auth.GuardWindowStartedAt.IsZero() {

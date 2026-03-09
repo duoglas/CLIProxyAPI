@@ -64,6 +64,11 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata["disabled"] = auth.Disabled
+	auth.Metadata["quarantined"] = auth.Quarantined
 
 	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
 	type metadataSetter interface {
@@ -79,7 +84,6 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			return "", err
 		}
 	case auth.Metadata != nil:
-		auth.Metadata["disabled"] = auth.Disabled
 		raw, errMarshal := json.Marshal(auth.Metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
@@ -233,6 +237,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	}
 	id := s.idFor(path, baseDir)
 	disabled, _ := metadata["disabled"].(bool)
+	quarantined, _ := metadata["quarantined"].(bool)
 	status := cliproxyauth.StatusActive
 	if disabled {
 		status = cliproxyauth.StatusDisabled
@@ -244,6 +249,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 		Label:            s.labelFor(metadata),
 		Status:           status,
 		Disabled:         disabled,
+		Quarantined:      quarantined,
 		Attributes:       map[string]string{"path": path},
 		Metadata:         metadata,
 		CreatedAt:        info.ModTime(),
