@@ -233,8 +233,21 @@ type AuthMaintenanceConfig struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first", "simhash".
+	// Supported values: "round-robin" (default), "fill-first", "success-rate", "simhash".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// SuccessRate configures the "success-rate" routing strategy.
+	SuccessRate RoutingSuccessRateConfig `yaml:"success-rate" json:"success-rate"`
+}
+
+// RoutingSuccessRateConfig configures the success-rate selector.
+// The selector uses a time-decayed (EMA) success rate per auth and model.
+type RoutingSuccessRateConfig struct {
+	// HalfLifeSeconds is the EMA half-life in seconds. Default: 1800 (30 minutes).
+	HalfLifeSeconds int `yaml:"half-life-seconds" json:"half-life-seconds"`
+	// ExploreRate is the probability [0,1] of randomly exploring an auth candidate.
+	// Default: 0.02.
+	ExploreRate float64 `yaml:"explore-rate" json:"explore-rate"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -686,6 +699,21 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.AuthMaintenance.DeleteStatusCodes = normalizeAuthMaintenanceStatusCodes(cfg.AuthMaintenance.DeleteStatusCodes)
 	if cfg.AuthMaintenance.QuotaStrikeThreshold <= 0 {
 		cfg.AuthMaintenance.QuotaStrikeThreshold = 6
+	}
+
+	// Sanitize routing config.
+	cfg.Routing.Strategy = strings.TrimSpace(cfg.Routing.Strategy)
+	if cfg.Routing.SuccessRate.HalfLifeSeconds <= 0 {
+		cfg.Routing.SuccessRate.HalfLifeSeconds = 1800
+	}
+	if cfg.Routing.SuccessRate.ExploreRate == 0 {
+		cfg.Routing.SuccessRate.ExploreRate = 0.02
+	}
+	if cfg.Routing.SuccessRate.ExploreRate < 0 {
+		cfg.Routing.SuccessRate.ExploreRate = 0
+	}
+	if cfg.Routing.SuccessRate.ExploreRate > 1 {
+		cfg.Routing.SuccessRate.ExploreRate = 1
 	}
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
@@ -1386,6 +1414,16 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 			return node.Value == "10"
 		case "usage-statistics-persist-interval-seconds":
 			return node.Value == "30"
+		case "routing.success-rate.half-life-seconds":
+			return node.Value == "1800"
+		}
+	}
+
+	// Check float defaults
+	if node.Kind == yaml.ScalarNode && node.Tag == "!!float" {
+		switch fullPath {
+		case "routing.success-rate.explore-rate":
+			return node.Value == "0.02"
 		}
 	}
 

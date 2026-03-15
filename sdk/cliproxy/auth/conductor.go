@@ -1895,6 +1895,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 	}
 
+	now := time.Now()
+
 	shouldResumeModel := false
 	shouldSuspendModel := false
 	suspendReason := ""
@@ -1911,7 +1913,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			auth.LastRequestSimHash = result.RequestSimHash
 			auth.HasLastRequestSimHash = true
 		}
-		now := time.Now()
 		if result.Success {
 			if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
@@ -2050,6 +2051,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
 	} else if shouldSuspendModel {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+	}
+
+	// 反馈型 selector 只在进程内维护评分，不参与持久化，因此在结果落库后再喂回运行态统计。
+	if observer, ok := m.selector.(ResultObserver); ok && observer != nil {
+		observer.ObserveResult(result, now)
 	}
 
 	hook := m.Hook()
