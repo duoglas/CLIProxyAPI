@@ -161,6 +161,9 @@ func normalizeCodexPreparedBody(body []byte, mode codexPreparedRequestPlanMode, 
 		if state.hasSafetyIdentifier {
 			body = deleteCodexJSONField(body, "safety_identifier")
 		}
+		if state.hasStreamOptions {
+			body = deleteCodexJSONField(body, "stream_options")
+		}
 		if !state.hasInstructions {
 			body = setCodexJSONStringField(body, "instructions", "")
 		}
@@ -173,6 +176,9 @@ func normalizeCodexPreparedBody(body []byte, mode codexPreparedRequestPlanMode, 
 		}
 		if state.hasSafetyIdentifier {
 			body = deleteCodexJSONField(body, "safety_identifier")
+		}
+		if state.hasStreamOptions {
+			body = deleteCodexJSONField(body, "stream_options")
 		}
 		if !state.modelMatches {
 			body = setCodexJSONStringField(body, "model", baseModel)
@@ -204,6 +210,7 @@ type codexPreparedBodyState struct {
 	hasPreviousResponseID   bool
 	hasPromptCacheRetention bool
 	hasSafetyIdentifier     bool
+	hasStreamOptions        bool
 	hasInstructions         bool
 }
 
@@ -227,6 +234,8 @@ func inspectCodexPreparedBody(body []byte, baseModel string) (codexPreparedBodyS
 			state.hasPromptCacheRetention = true
 		case "safety_identifier":
 			state.hasSafetyIdentifier = true
+		case "stream_options":
+			state.hasStreamOptions = true
 		case "instructions":
 			state.hasInstructions = true
 		}
@@ -243,11 +252,13 @@ func normalizeCodexPreparedBodyFallback(body []byte, mode codexPreparedRequestPl
 		body = deleteJSONFieldIfExists(body, "previous_response_id")
 		body = deleteJSONFieldIfExists(body, "prompt_cache_retention")
 		body = deleteJSONFieldIfExists(body, "safety_identifier")
+		body = deleteJSONFieldIfExists(body, "stream_options")
 		body = ensureJSONStringField(body, "instructions", "")
 	case codexPreparedRequestPlanExecuteStream:
 		body = deleteJSONFieldIfExists(body, "previous_response_id")
 		body = deleteJSONFieldIfExists(body, "prompt_cache_retention")
 		body = deleteJSONFieldIfExists(body, "safety_identifier")
+		body = deleteJSONFieldIfExists(body, "stream_options")
 		body = setJSONStringFieldIfNeeded(body, "model", baseModel)
 		body = setJSONBoolFieldIfNeeded(body, "stream", true)
 		body = ensureJSONStringField(body, "instructions", "")

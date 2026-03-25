@@ -186,6 +186,34 @@ func TestCodexPrepareRequestPlan_SkipsCacheForSmallPayloads(t *testing.T) {
 	}
 }
 
+func TestCodexPrepareRequestPlan_StripsStreamOptions(t *testing.T) {
+	executor := &CodexExecutor{}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: []byte(`{"model":"gpt-5.4","input":"hello","stream":true,"stream_options":{"include_usage":true}}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai"),
+		Stream:       true,
+		Metadata: map[string]any{
+			cliproxyexecutor.RequestedModelMetadataKey: "gpt-5.4",
+		},
+	}
+
+	for _, mode := range []codexPreparedRequestPlanMode{
+		codexPreparedRequestPlanExecute,
+		codexPreparedRequestPlanExecuteStream,
+	} {
+		plan, err := executor.prepareCodexRequestPlan(context.Background(), req, opts, mode)
+		if err != nil {
+			t.Fatalf("prepareCodexRequestPlan(%s) error = %v", mode, err)
+		}
+		if got := gjson.GetBytes(plan.body, "stream_options"); got.Exists() {
+			t.Fatalf("prepareCodexRequestPlan(%s) kept stream_options = %s", mode, got.Raw)
+		}
+	}
+}
+
 func TestCodexResponseTranslatorNeedsRequestPayloads(t *testing.T) {
 	if codexResponseTranslatorNeedsRequestPayloads(sdktranslator.FromString("openai-response")) {
 		t.Fatal("openai-response translator should not retain request payloads")
