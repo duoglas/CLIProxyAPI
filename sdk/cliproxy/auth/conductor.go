@@ -293,6 +293,16 @@ func (m *Manager) SetHook(hook Hook) {
 	m.hookValue.Store(hookState{hook: hook})
 }
 
+// Selector returns the current selector snapshot for hot-reload style reconfiguration.
+func (m *Manager) Selector() Selector {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.selector
+}
+
 // SetStore swaps the underlying persistence store.
 func (m *Manager) SetStore(store Store) {
 	m.mu.Lock()
