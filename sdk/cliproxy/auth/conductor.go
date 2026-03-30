@@ -144,6 +144,7 @@ type Manager struct {
 	executors map[string]ProviderExecutor
 	selector  Selector
 	hookValue atomic.Value
+	blockedRequests *blockedRequestLRU
 	mu        sync.RWMutex
 	auths     map[string]*Auth
 	scheduler *authScheduler
@@ -196,6 +197,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		store:            store,
 		executors:        make(map[string]ProviderExecutor),
 		selector:         selector,
+		blockedRequests:  newBlockedRequestLRU(1000),
 		auths:            make(map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
@@ -1051,6 +1053,9 @@ func (m *Manager) Load(ctx context.Context) error {
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	ctx = m.withAuditContext(ctx, req, opts)
+	if err := m.rejectBlockedRequest(opts); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -1083,6 +1088,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	ctx = m.withAuditContext(ctx, req, opts)
+	if err := m.rejectBlockedRequest(opts); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -1115,6 +1123,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	ctx = m.withAuditContext(ctx, req, opts)
+	if err := m.rejectBlockedRequest(opts); err != nil {
+		return nil, err
+	}
 	normalized := m.normalizeProviders(providers)
 	if len(normalized) == 0 {
 		return nil, &Error{Code: "provider_not_found", Message: "no provider supplied"}
@@ -1220,6 +1231,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
+				m.recordBlockedRequest(opts, errExec)
 				if isRequestInvalidError(errExec) {
 					m.Hook().OnResult(execCtx, result)
 					authErr = errExec
@@ -1324,7 +1336,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-
+				m.recordBlockedRequest(opts, errExec)
 				if isRequestInvalidError(errExec) {
 					m.Hook().OnResult(execCtx, result)
 					authErr = errExec
@@ -1421,6 +1433,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
+			m.recordBlockedRequest(opts, errStream)
 			if isRequestInvalidError(errStream) {
 				requestInvalidErr = errStream
 				if maxInvalidRequestRetries == 0 || invalidRetryAttempts >= maxInvalidRequestRetries {
@@ -2294,6 +2307,10 @@ func isModelSupportResultError(err *Error) bool {
 // caller-side 400 validation signals such as invalid_request_error,
 // invalid_json_schema, or unsupported parameters are treated as request-invalid.
 func isRequestInvalidError(err error) bool {
+	return isBlockableInvalidRequestError(err)
+}
+
+func isBlockableInvalidRequestError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -2302,13 +2319,59 @@ func isRequestInvalidError(err error) bool {
 	}
 	status := statusCodeFromError(err)
 	switch status {
-	case http.StatusBadRequest:
-		return isRequestInvalidBody(err.Error())
-	case http.StatusUnprocessableEntity:
-		return true
-	default:
+	case http.StatusUnauthorized, http.StatusTooManyRequests:
 		return false
 	}
+	if isTransientError(err) {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if message == "" {
+		return false
+	}
+	if strings.Contains(message, "invalid_function_parameters") {
+		return true
+	}
+	if status == http.StatusBadRequest {
+		return strings.Contains(message, "invalid_request_error") ||
+			strings.Contains(message, "invalid response format") ||
+			strings.Contains(message, "invalid_response_format") ||
+			strings.Contains(message, "response_format")
+	}
+	if status == http.StatusUnprocessableEntity {
+		return true
+	}
+	return false
+}
+
+func (m *Manager) rejectBlockedRequest(opts cliproxyexecutor.Options) error {
+	if m == nil || m.blockedRequests == nil {
+		return nil
+	}
+	hash, ok := requestBodyHash(opts.OriginalRequest)
+	if !ok {
+		return nil
+	}
+	if !m.blockedRequests.Contains(hash) {
+		return nil
+	}
+	return &Error{
+		Code:       "blocked_invalid_request",
+		Message:    "request body matches a previously blocked invalid request",
+		Retryable:  false,
+		HTTPStatus: http.StatusBadRequest,
+	}
+}
+
+func (m *Manager) recordBlockedRequest(opts cliproxyexecutor.Options, err error) {
+	if m == nil || m.blockedRequests == nil || !isBlockableInvalidRequestError(err) {
+		return
+	}
+	hash, ok := requestBodyHash(opts.OriginalRequest)
+	if !ok {
+		return
+	}
+	m.blockedRequests.Add(hash)
 }
 
 type requestInvalidBody struct {

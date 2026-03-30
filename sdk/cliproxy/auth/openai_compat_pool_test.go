@@ -381,6 +381,57 @@ func TestManagerExecute_OpenAICompatAliasPoolFallsBackOnModelSupportUnprocessabl
 	}
 }
 
+func TestManagerExecute_BlocksRepeatedInvalidFunctionParametersRequest(t *testing.T) {
+	alias := "claude-opus-4.66"
+	invalidErr := &Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_function_parameters"}
+	executor := &openAICompatPoolExecutor{
+		id:            "pool",
+		executeErrors: map[string]error{"qwen3.5-plus": invalidErr},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+	}, executor)
+	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"model":"claude-opus-4.66","tools":[{"type":"function","name":"bad"}]}`)}
+
+	_, err := m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err == nil || err.Error() != invalidErr.Error() {
+		t.Fatalf("first execute error = %v, want %v", err, invalidErr)
+	}
+	_, err = m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	if err == nil {
+		t.Fatal("expected blocked invalid request error")
+	}
+	authErr, ok := err.(*Error)
+	if !ok || authErr.Code != "blocked_invalid_request" {
+		t.Fatalf("second execute error = %#v, want blocked_invalid_request", err)
+	}
+	got := executor.ExecuteModels()
+	if len(got) != 1 {
+		t.Fatalf("execute calls = %v, want only first upstream attempt", got)
+	}
+}
+
+func TestManagerExecute_DoesNotBlockRepeatedUnauthorizedRequest(t *testing.T) {
+	alias := "claude-opus-4.66"
+	unauthorizedErr := &Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"}
+	executor := &openAICompatPoolExecutor{
+		id:            "pool",
+		executeErrors: map[string]error{"qwen3.5-plus": unauthorizedErr},
+	}
+	m := newOpenAICompatPoolTestManager(t, alias, []internalconfig.OpenAICompatibilityModel{
+		{Name: "qwen3.5-plus", Alias: alias},
+	}, executor)
+	opts := cliproxyexecutor.Options{OriginalRequest: []byte(`{"model":"claude-opus-4.66"}`)}
+
+	_, _ = m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+	_, _ = m.Execute(context.Background(), []string{"pool"}, cliproxyexecutor.Request{Model: alias}, opts)
+
+	got := executor.ExecuteModels()
+	if len(got) != 2 {
+		t.Fatalf("execute calls = %v, want two upstream attempts", got)
+	}
+}
+
 func TestManagerExecute_OpenAICompatAliasPoolFallsBackWithinSameAuth(t *testing.T) {
 	alias := "claude-opus-4.66"
 	executor := &openAICompatPoolExecutor{
