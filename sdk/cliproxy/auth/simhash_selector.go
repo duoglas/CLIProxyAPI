@@ -2,10 +2,9 @@ package auth
 
 import (
 	"context"
-	"fmt"
 	"hash/fnv"
 	"math/bits"
-	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,9 +19,10 @@ const (
 )
 
 type simHashPoolState struct {
-	members        map[string]struct{}
-	everFilled     bool
-	lastAdmittedAt time.Time
+	members             map[string]struct{}
+	everFilled          bool
+	lastAdmittedAt      time.Time
+	preferredOutsiderID string
 }
 
 // SimHashSelector routes requests to the nearest available auth by request SimHash.
@@ -167,6 +167,11 @@ func (s *SimHashSelector) prunePoolLocked(allAuths []*Auth, now time.Time) {
 			delete(s.pool.members, authID)
 		}
 	}
+	if s.pool.preferredOutsiderID != "" {
+		if _, ok := globallyAvailableIDs[s.pool.preferredOutsiderID]; !ok {
+			s.pool.preferredOutsiderID = ""
+		}
+	}
 }
 
 func (s *SimHashSelector) partitionAvailableLocked(available []*Auth) ([]*Auth, []*Auth) {
@@ -187,22 +192,40 @@ func (s *SimHashSelector) partitionAvailableLocked(available []*Auth) ([]*Auth, 
 
 func (s *SimHashSelector) pickAdmissionCandidateLocked(now time.Time, auths []*Auth) *Auth {
 	if len(auths) == 0 {
+		s.pool.preferredOutsiderID = ""
 		return nil
 	}
 	if len(auths) == 1 {
+		s.pool.preferredOutsiderID = auths[0].ID
 		return auths[0]
 	}
-	ordered := append([]*Auth(nil), auths...)
+	if preferred := s.findAuthByID(auths, s.pool.preferredOutsiderID); preferred != nil {
+		return preferred
+	}
 	epoch := admissionEpoch(now)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		left := admissionOrderScore(epoch, ordered[i])
-		right := admissionOrderScore(epoch, ordered[j])
-		if left != right {
-			return left < right
+	best := auths[0]
+	bestScore := admissionOrderScore(epoch, best)
+	for _, candidate := range auths[1:] {
+		score := admissionOrderScore(epoch, candidate)
+		if score < bestScore || (score == bestScore && candidate.ID < best.ID) {
+			best = candidate
+			bestScore = score
 		}
-		return ordered[i].ID < ordered[j].ID
-	})
-	return ordered[0]
+	}
+	s.pool.preferredOutsiderID = best.ID
+	return best
+}
+
+func (s *SimHashSelector) findAuthByID(auths []*Auth, authID string) *Auth {
+	if authID == "" {
+		return nil
+	}
+	for _, auth := range auths {
+		if auth != nil && auth.ID == authID {
+			return auth
+		}
+	}
+	return nil
 }
 
 func (s *SimHashSelector) pickRoundRobinLocked(key string, auths []*Auth) *Auth {
