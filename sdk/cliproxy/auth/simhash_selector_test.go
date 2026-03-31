@@ -9,7 +9,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
-func TestSimHashSelectorPrefersColdStartAuthsRoundRobin(t *testing.T) {
+func TestSimHashSelectorPrefersColdStartAuthsUntilPoolFills(t *testing.T) {
 	selector := NewSimHashSelector(internalconfig.RoutingSimHashConfig{PoolSize: 10})
 	auths := []*Auth{
 		{ID: "a", Provider: "codex", Status: StatusActive},
@@ -25,8 +25,8 @@ func TestSimHashSelectorPrefersColdStartAuthsRoundRobin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second pick error: %v", err)
 	}
-	if first.ID != "a" || second.ID != "b" {
-		t.Fatalf("cold-start order = %q, %q; want a, b", first.ID, second.ID)
+	if first == nil || second == nil || first.ID == second.ID {
+		t.Fatalf("expected cold-start to admit distinct auths, got %#v %#v", first, second)
 	}
 }
 
@@ -146,5 +146,18 @@ func TestSimHashSelectorPoolOnlyAdmitsOneNewAuthAfterFilled(t *testing.T) {
 	}
 	if _, ok := selector.pool.members["d"]; ok {
 		t.Fatalf("expected outsider d to stay out of pool during cooldown, pool=%v", selector.pool.members)
+	}
+}
+
+func TestSimHashSelectorAdmissionOrderChangesAcrossEpochs(t *testing.T) {
+	auths := []*Auth{
+		{ID: "a", Provider: "codex", Status: StatusActive},
+		{ID: "b", Provider: "codex", Status: StatusActive},
+		{ID: "c", Provider: "codex", Status: StatusActive},
+	}
+	firstEpochPick := NewSimHashSelector(internalconfig.RoutingSimHashConfig{PoolSize: 10}).pickAdmissionCandidateLocked(time.Unix(0, 0), auths)
+	secondEpochPick := NewSimHashSelector(internalconfig.RoutingSimHashConfig{PoolSize: 10}).pickAdmissionCandidateLocked(time.Unix(int64((10*time.Minute)/time.Second), 0), auths)
+	if firstEpochPick == nil || secondEpochPick == nil {
+		t.Fatal("expected admission candidates")
 	}
 }

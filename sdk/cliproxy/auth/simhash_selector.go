@@ -3,7 +3,9 @@ package auth
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"math/bits"
+	"sort"
 	"sync"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 const (
 	defaultSimHashPoolSize            = 10
 	defaultSimHashAdmitCooldownSecond = 1
+	simHashAdmissionEpoch             = 10 * time.Minute
 )
 
 type simHashPoolState struct {
@@ -180,6 +183,26 @@ func (s *SimHashSelector) partitionAvailableLocked(available []*Auth) ([]*Auth, 
 		}
 	}
 	return members, outsiders
+}
+
+func (s *SimHashSelector) pickAdmissionCandidateLocked(now time.Time, auths []*Auth) *Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	if len(auths) == 1 {
+		return auths[0]
+	}
+	ordered := append([]*Auth(nil), auths...)
+	epoch := admissionEpoch(now)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left := admissionOrderScore(epoch, ordered[i])
+		right := admissionOrderScore(epoch, ordered[j])
+		if left != right {
+			return left < right
+		}
+		return ordered[i].ID < ordered[j].ID
+	})
+	return ordered[0]
 }
 
 func (s *SimHashSelector) pickRoundRobinLocked(key string, auths []*Auth) *Auth {
