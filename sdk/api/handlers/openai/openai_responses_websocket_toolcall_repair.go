@@ -16,6 +16,7 @@ var defaultWebsocketToolPairStates = newWebsocketToolPairStateRegistry()
 var defaultWebsocketToolPairRefs = newWebsocketToolPairRefCounter()
 
 type websocketToolPairState struct {
+	mu          sync.RWMutex
 	outputs     map[string]json.RawMessage
 	outputOrder []string
 	calls       map[string]json.RawMessage
@@ -102,6 +103,8 @@ func (s *websocketToolPairState) recordOutput(callID string, item json.RawMessag
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	recordWebsocketToolPairItem(s.outputs, &s.outputOrder, callID, item)
 }
 
@@ -109,6 +112,8 @@ func (s *websocketToolPairState) recordCall(callID string, item json.RawMessage)
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	recordWebsocketToolPairItem(s.calls, &s.callOrder, callID, item)
 }
 
@@ -116,6 +121,8 @@ func (s *websocketToolPairState) getOutput(callID string) (json.RawMessage, bool
 	if s == nil {
 		return nil, false
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	item, ok := s.outputs[strings.TrimSpace(callID)]
 	if !ok || len(item) == 0 {
 		return nil, false
@@ -127,6 +134,8 @@ func (s *websocketToolPairState) getCall(callID string) (json.RawMessage, bool) 
 	if s == nil {
 		return nil, false
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	item, ok := s.calls[strings.TrimSpace(callID)]
 	if !ok || len(item) == 0 {
 		return nil, false
