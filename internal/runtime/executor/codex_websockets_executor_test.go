@@ -218,6 +218,37 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	}
 }
 
+func TestApplyCodexHeadersSkipsGeneratedSessionIDForNonMacUserAgent(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"User-Agent": "codex-cli/0.1 (Linux; x64)",
+	}))
+
+	applyCodexHeaders(req, nil, "oauth-token", true, &config.Config{
+		CodexHeaderDefaults: config.CodexHeaderDefaults{
+			UserAgent: "codex-cli/0.1 (Linux; x64)",
+		},
+	})
+
+	if got := req.Header.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want empty for non-Mac user agent", got)
+	}
+}
+
+func TestApplyCodexWebsocketHeadersSkipsGeneratedSessionIDForNonMacUserAgent(t *testing.T) {
+	ctx := contextWithGinHeaders(map[string]string{
+		"User-Agent": "codex-cli/0.1 (Linux; x64)",
+	})
+	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, nil, "", nil)
+
+	if got := headers.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want empty for non-Mac user agent", got)
+	}
+}
+
 func TestCodexAutoExecutorExecuteStream_WebsocketStripsPrefixedModelFromOutboundRequest(t *testing.T) {
 	t.Parallel()
 
@@ -345,6 +376,22 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
+	}
+}
+
+func TestApplyCodexHeadersPassesThroughBetaFeaturesHeader(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req = req.WithContext(contextWithGinHeaders(map[string]string{
+		"X-Codex-Beta-Features": "tool-streaming,v2",
+	}))
+
+	applyCodexHeaders(req, nil, "oauth-token", true, nil)
+
+	if got := req.Header.Get("X-Codex-Beta-Features"); got != "tool-streaming,v2" {
+		t.Fatalf("X-Codex-Beta-Features = %q, want %q", got, "tool-streaming,v2")
 	}
 }
 
