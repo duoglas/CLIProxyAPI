@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -633,6 +635,41 @@ func TestShouldRepairResponsesWebsocketToolCalls(t *testing.T) {
 	}
 	if !shouldRepairResponsesWebsocketToolCalls(`[{"type":"function_call_output","call_id":"call-1"}]`) {
 		t.Fatal("expected function_call_output input to require repair")
+	}
+}
+
+func TestWebsocketToolPairStateConcurrentAccess(t *testing.T) {
+	state := newWebsocketToolPairState()
+	const workers = 16
+	const iterations = 200
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < iterations; j++ {
+				callID := fmt.Sprintf("call-%d", j%8)
+				state.recordCall(callID, json.RawMessage(fmt.Sprintf(`{"type":"function_call","call_id":"%s","name":"tool_%d"}`, callID, worker)))
+				state.recordOutput(callID, json.RawMessage(fmt.Sprintf(`{"type":"function_call_output","call_id":"%s","output":"ok"}`, callID)))
+				_, _ = state.getCall(callID)
+				_, _ = state.getOutput(callID)
+			}
+		}(i)
+	}
+	close(start)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent tool pair state access timed out")
 	}
 }
 

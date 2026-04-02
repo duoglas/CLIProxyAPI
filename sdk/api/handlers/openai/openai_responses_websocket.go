@@ -327,8 +327,10 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 			Error:      fmt.Errorf("invalid request input: %w", errMerge),
 		}
 	}
-	if dedupedInput, errDedupe := dedupeFunctionCallsByCallID(mergedInput); errDedupe == nil {
-		mergedInput = dedupedInput
+	if shouldRepairResponsesWebsocketToolCalls(mergedInput) {
+		if dedupedInput, errDedupe := dedupeFunctionCallsByCallID(mergedInput); errDedupe == nil {
+			mergedInput = dedupedInput
+		}
 	}
 
 	normalized, errDelete := sjson.DeleteBytes(rawJSON, "type")
