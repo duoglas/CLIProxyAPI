@@ -59,6 +59,20 @@ func (r *usageReporter) trackFailure(ctx context.Context, errPtr *error) {
 	}
 }
 
+// finalize publishes exactly one terminal usage record based on the final
+// function error state. Success paths emit a default record when no explicit
+// usage detail was published; failure paths emit a failed record.
+func (r *usageReporter) finalize(ctx context.Context, errPtr *error) {
+	if r == nil {
+		return
+	}
+	if errPtr != nil && *errPtr != nil {
+		r.publishFailure(ctx)
+		return
+	}
+	r.ensurePublished(ctx)
+}
+
 func (r *usageReporter) publishWithOutcome(ctx context.Context, detail usage.Detail, failed bool) {
 	if r == nil {
 		return

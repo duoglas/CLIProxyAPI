@@ -243,8 +243,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.trackFailure(ctx, &err)
-	defer reporter.ensurePublished(ctx)
+	defer reporter.finalize(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
@@ -453,8 +452,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.trackFailure(ctx, &err)
-	defer reporter.ensurePublished(ctx)
+	defer reporter.finalize(ctx, &err)
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")

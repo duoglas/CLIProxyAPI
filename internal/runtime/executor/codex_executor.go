@@ -92,8 +92,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.trackFailure(ctx, &err)
-	defer reporter.ensurePublished(ctx)
+	defer reporter.finalize(ctx, &err)
 
 	from := opts.SourceFormat
 	plan, err := e.prepareCodexRequestPlan(ctx, req, opts, codexPreparedRequestPlanExecute)
@@ -178,8 +177,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.trackFailure(ctx, &err)
-	defer reporter.ensurePublished(ctx)
+	defer reporter.finalize(ctx, &err)
 
 	from := opts.SourceFormat
 	plan, err := e.prepareCodexRequestPlan(ctx, req, opts, codexPreparedRequestPlanCompact)
@@ -266,8 +264,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	}
 
 	reporter := newUsageReporter(ctx, e.Identifier(), baseModel, auth)
-	defer reporter.trackFailure(ctx, &err)
-	defer reporter.ensurePublished(ctx)
+	defer reporter.finalize(ctx, &err)
 
 	from := opts.SourceFormat
 	plan, err := e.prepareCodexRequestPlan(ctx, req, opts, codexPreparedRequestPlanExecuteStream)
