@@ -57,7 +57,6 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	passthroughSessionID := uuid.NewString()
 	log.Infof("responses websocket: client connected id=%s remote=%s", passthroughSessionID, websocketClientAddress(c))
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
-	retainResponsesWebsocketToolCaches(downstreamSessionKey)
 	var wsTerminateErr error
 	var wsBodyLog strings.Builder
 	toolPairState := acquireResponsesWebsocketToolPairState(downstreamSessionKey)
@@ -494,13 +493,6 @@ func normalizeResponseTranscriptReplacement(rawJSON []byte, lastRequest []byte) 
 	}
 	normalized, _ = sjson.SetBytes(normalized, "stream", true)
 	return bytes.Clone(normalized)
-}
-
-func websocketClientAddress(c *gin.Context) string {
-	if c == nil || c.Request == nil {
-		return ""
-	}
-	return strings.TrimSpace(c.ClientIP())
 }
 
 func websocketUpstreamSupportsIncrementalInput(attributes map[string]string, metadata map[string]any) bool {
