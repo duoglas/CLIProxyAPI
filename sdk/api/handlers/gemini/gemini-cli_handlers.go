@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -47,18 +46,9 @@ func (h *GeminiCLIAPIHandler) Models() []map[string]any {
 }
 
 // CLIHandler handles CLI-specific requests for Gemini API operations.
-// It restricts access to localhost only and routes requests to appropriate internal handlers.
+// Access control is enforced at the router level so authenticated clients can
+// use Gemini CLI-compatible routes through the public proxy.
 func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
-	if !strings.HasPrefix(c.Request.RemoteAddr, "127.0.0.1:") {
-		c.JSON(http.StatusForbidden, handlers.ErrorResponse{
-			Error: handlers.ErrorDetail{
-				Message: "CLI reply only allow local access",
-				Type:    "forbidden",
-			},
-		})
-		return
-	}
-
 	rawJSON, _ := c.GetRawData()
 	requestRawURI := c.Request.URL.Path
 
