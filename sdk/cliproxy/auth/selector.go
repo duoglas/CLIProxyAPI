@@ -248,10 +248,10 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	return available, nil
 }
 
-// Pick selects the next available auth for the provider in a round-robin manner.
+// Pick selects an available auth for the provider using random selection.
 // For gemini-cli virtual auths (identified by the gemini_virtual_parent attribute),
-// a two-level round-robin is used: first cycling across credential groups (parent
-// accounts), then cycling within each group's project auths.
+// a two-level random selection is used: first randomly picking a credential group,
+// then randomly picking within that group's project auths.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
@@ -260,57 +260,21 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	key := provider + ":" + canonicalModelKey(model)
-	s.mu.Lock()
-	if s.cursors == nil {
-		s.cursors = make(map[string]int)
-	}
-	limit := s.maxKeys
-	if limit <= 0 {
-		limit = 4096
-	}
 
 	// Check if any available auth has gemini_virtual_parent attribute,
 	// indicating gemini-cli virtual auths that should use credential-level polling.
 	groups, parentOrder := groupByVirtualParent(available)
 	if len(parentOrder) > 1 {
-		// Two-level round-robin: first select a credential group, then pick within it.
-		groupKey := key + "::group"
-		s.ensureCursorKey(groupKey, limit)
-		if _, exists := s.cursors[groupKey]; !exists {
-			// Seed with a random initial offset so the starting credential is randomized.
-			s.cursors[groupKey] = rand.IntN(len(parentOrder))
-		}
-		groupIndex := s.cursors[groupKey]
-		if groupIndex >= 2_147_483_640 {
-			groupIndex = 0
-		}
-		s.cursors[groupKey] = groupIndex + 1
-
-		selectedParent := parentOrder[groupIndex%len(parentOrder)]
+		// Two-level random selection: randomly pick a credential group, then randomly pick within it.
+		selectedParent := parentOrder[rand.IntN(len(parentOrder))]
 		group := groups[selectedParent]
-
-		// Second level: round-robin within the selected credential group.
-		innerKey := key + "::cred:" + selectedParent
-		s.ensureCursorKey(innerKey, limit)
-		innerIndex := s.cursors[innerKey]
-		if innerIndex >= 2_147_483_640 {
-			innerIndex = 0
-		}
-		s.cursors[innerKey] = innerIndex + 1
-		s.mu.Unlock()
-		return group[innerIndex%len(group)], nil
+		return group[rand.IntN(len(group))], nil
 	}
 
-	// Flat round-robin for non-grouped auths (original behavior).
-	s.ensureCursorKey(key, limit)
-	index := s.cursors[key]
-	if index >= 2_147_483_640 {
-		index = 0
-	}
-	s.cursors[key] = index + 1
-	s.mu.Unlock()
-	return available[index%len(available)], nil
+	// Random selection: pick a random credential from the available pool.
+	// This avoids the strict sequential pattern of pure round-robin, which is
+	// trivially detectable by observing credential rotation order.
+	return available[rand.IntN(len(available))], nil
 }
 
 // ensureCursorKey ensures the cursor map has capacity for the given key.
