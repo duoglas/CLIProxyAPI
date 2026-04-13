@@ -133,6 +133,8 @@ type ClaudeHeaderDefaults struct {
 	PackageVersion string `yaml:"package-version" json:"package-version"`
 	RuntimeVersion string `yaml:"runtime-version" json:"runtime-version"`
 	Timeout        string `yaml:"timeout" json:"timeout"`
+	OS             string `yaml:"os" json:"os"`
+	Arch           string `yaml:"arch" json:"arch"`
 }
 
 // TLSConfig holds HTTPS server settings.
