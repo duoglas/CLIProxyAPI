@@ -1,40 +1,28 @@
-# CLIProxyAPI Auth/Codex Fork
+# CLIProxyAPI (Anti-Detection Hardened Fork)
 
 English | [中文](README_CN.md)
 
-This repository is an independently maintained derivative of `router-for-me/CLIProxyAPI`.
+This repository is a hardened derivative of [`Arron196/CLIProxyAPI`](https://github.com/Arron196/CLIProxyAPI), focused on **anti-detection improvements** for safer daily usage.
 
-It is not the upstream project, is not affiliated with `router-for-me`, and should not be represented as an official mirror, release channel, support channel, or documentation endpoint for the upstream repository.
+## What This Fork Adds
 
-## What This Fork Is
+All changes from `Arron196/CLIProxyAPI` are preserved. On top of that, this fork applies the following anti-detection hardening:
 
-This fork keeps the original CLI proxy compatibility goals while carrying a smaller set of local changes focused on runtime behavior instead of product promotion.
-
-Current fork-specific changes relative to `router-for-me/CLIProxyAPI`:
-
-- Codex/OpenAI Responses request translation adjustments and executor wiring updates
-- Auth scheduler behavior changes aimed at lower churn under concurrency
-- Async auth persistence additions
-- Scheduler benchmark and persistence test updates
-- Container defaults adjusted for this repository's GHCR image distribution
-
-At the moment, the Go module path is still `github.com/router-for-me/CLIProxyAPI/v6` for compatibility with the existing code layout. That compatibility detail does not imply any project affiliation.
-
-## Core Capabilities
-
-- OpenAI, Gemini, Claude, and Codex compatible API endpoints for CLI-oriented clients
-- OAuth-based support for Codex, Claude Code, Qwen Code, and iFlow
-- Streaming and non-streaming responses
-- Multi-account routing and load balancing
-- Reusable Go SDK under `sdk/cliproxy`
-- Request translation and provider execution layers suitable for embedding
+| Change | Purpose |
+|--------|---------|
+| Haiku model cloaking fix | All models now receive full cloaking (billing header + system prompt injection). Previously `claude-3-5-haiku` was skipped, creating a detectable fingerprint. |
+| Configurable billing header version | `cc_version` in the billing header now reads from `claude-header-defaults.user-agent` in config, instead of hardcoded `2.1.63`. Update config when Claude Code releases new versions. |
+| Remove `Connection: keep-alive` | HTTP/2 hop-by-hop header that real Node.js clients don't send. Removed to eliminate a proxy fingerprint. |
+| Random credential selection | Replaced strict round-robin with random selection. Prevents upstream from predicting the next credential based on rotation pattern. |
+| Per-credential connection pool | Each credential gets an isolated HTTP transport. Prevents HTTP/2 multiplexing from correlating multiple accounts on the same TCP connection. |
+| TOCTOU race fix in transport cache | Prevents duplicate transport creation under concurrent access. |
 
 ## Quick Start
 
-Use the fork's GHCR image:
+Build locally and deploy:
 
 ```bash
-docker run --rm -p 8317:8317 ghcr.io/arron196/cliproxyapi:latest
+docker build -t cpa-hardened:latest .
 ```
 
 Or with Compose:
@@ -43,10 +31,28 @@ Or with Compose:
 docker compose up -d
 ```
 
-The default image in `docker-compose.yml` is:
+## Configuration
 
-```text
-ghcr.io/arron196/cliproxyapi:latest
+Add `claude-header-defaults` to your `config.yaml` to control the Claude Code fingerprint:
+
+```yaml
+claude-header-defaults:
+  user-agent: "claude-cli/2.1.63 (external, cli)"
+  package-version: "0.74.0"
+  runtime-version: "v24.3.0"
+  timeout: "600"
+  os: "MacOS"          # Options: MacOS, Windows, Linux, FreeBSD
+  arch: "arm64"        # Options: arm64, x64, x86
+```
+
+When Claude Code releases a new version, update these values — no code changes or rebuild needed.
+
+## Syncing with Upstream
+
+```bash
+git remote add upstream https://github.com/Arron196/CLIProxyAPI.git
+git fetch upstream
+git merge upstream/main
 ```
 
 ## Local Documentation
@@ -56,19 +62,11 @@ ghcr.io/arron196/cliproxyapi:latest
 - SDK access/auth: [docs/sdk-access.md](docs/sdk-access.md)
 - SDK watcher integration: [docs/sdk-watcher.md](docs/sdk-watcher.md)
 
-Management endpoints are exposed under `/v0/management` when enabled in configuration. This fork does not currently publish a separate external documentation site.
-
 ## Project Identity
 
-- Upstream base: `router-for-me/CLIProxyAPI`
-- This repository: independent derivative maintained in a separate GitHub repository
-- Upstream relationship: no affiliation, no endorsement, no shared release process, no shared support obligation
-
-If you need upstream behavior or upstream support, use the upstream repository directly.
-
-## Contributing
-
-Contributions should target this repository's behavior and documentation, not the upstream project's release promises or commercial integrations.
+- Upstream base: [`Arron196/CLIProxyAPI`](https://github.com/Arron196/CLIProxyAPI)
+- Root upstream: `router-for-me/CLIProxyAPI`
+- This fork: independent hardened derivative
 
 ## License
 
