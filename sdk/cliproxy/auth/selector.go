@@ -10,19 +10,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
-// RoundRobinSelector provides a simple provider scoped round-robin selection strategy.
-type RoundRobinSelector struct {
-	mu      sync.Mutex
-	cursors map[string]int
-	maxKeys int
-}
+// RoundRobinSelector selects credentials using random selection within
+// the highest-priority tier. For gemini-cli virtual auths with multiple
+// credential groups, a two-level random selection is used.
+type RoundRobinSelector struct{}
 
 // FillFirstSelector selects the first available credential (deterministic ordering).
 // This "burns" one account before moving to the next, which can help stagger
@@ -248,10 +245,10 @@ func getAvailableAuths(auths []*Auth, provider, model string, now time.Time) ([]
 	return available, nil
 }
 
-// Pick selects the next available auth for the provider in a round-robin manner.
+// Pick selects an available auth for the provider using random selection.
 // For gemini-cli virtual auths (identified by the gemini_virtual_parent attribute),
-// a two-level round-robin is used: first cycling across credential groups (parent
-// accounts), then cycling within each group's project auths.
+// a two-level random selection is used: first randomly picking a credential group,
+// then randomly picking within that group's project auths.
 func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := time.Now()
@@ -277,18 +274,10 @@ func (s *RoundRobinSelector) Pick(ctx context.Context, provider, model string, o
 	return available[rand.IntN(len(available))], nil
 }
 
-// ensureCursorKey ensures the cursor map has capacity for the given key.
-// Must be called with s.mu held.
-func (s *RoundRobinSelector) ensureCursorKey(key string, limit int) {
-	if _, ok := s.cursors[key]; !ok && len(s.cursors) >= limit {
-		s.cursors = make(map[string]int)
-	}
-}
-
 // groupByVirtualParent groups auths by their gemini_virtual_parent attribute.
 // Returns a map of parentID -> auths and a sorted slice of parent IDs for stable iteration.
 // Only auths with a non-empty gemini_virtual_parent are grouped; if any auth lacks
-// this attribute, nil/nil is returned so the caller falls back to flat round-robin.
+// this attribute, nil/nil is returned so the caller falls back to flat random selection.
 func groupByVirtualParent(auths []*Auth) (map[string][]*Auth, []string) {
 	if len(auths) == 0 {
 		return nil, nil

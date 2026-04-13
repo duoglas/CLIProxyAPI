@@ -470,7 +470,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
-	body = checkSystemInstructions(body)
+	body = checkSystemInstructions(body, e.cfg)
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
 	body = enforceCacheControlLimit(body, 4)
@@ -884,7 +884,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	} else {
 		r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.63 (external, cli)"))
 	}
-	r.Header.Set("Connection", "keep-alive")
+	// Omit Connection header — it is a hop-by-hop header ignored in HTTP/2,
+	// and real Node.js clients do not send it. Including it is a proxy fingerprint.
+	r.Header.Del("Connection")
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
 		// SSE streams must not be compressed: the downstream scanner reads
@@ -926,8 +928,12 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 	return
 }
 
-func checkSystemInstructions(payload []byte) []byte {
-	return checkSystemInstructionsWithMode(payload, false, "")
+func checkSystemInstructions(payload []byte, cfg *config.Config) []byte {
+	var version string
+	if cfg != nil {
+		version = extractVersionFromUA(cfg.ClaudeHeaderDefaults.UserAgent)
+	}
+	return checkSystemInstructionsWithMode(payload, false, version)
 }
 
 func isClaudeOAuthToken(apiKey string) bool {

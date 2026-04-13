@@ -76,6 +76,12 @@ func (p *defaultRoundTripperProvider) RoundTripperFor(auth *coreauth.Auth) http.
 		return nil
 	}
 	p.mu.Lock()
+	// Re-check under write lock to avoid creating duplicate transports
+	// when multiple goroutines race on the same cache key.
+	if existing := p.cache[cacheKey]; existing != nil {
+		p.mu.Unlock()
+		return existing
+	}
 	p.cache[cacheKey] = transport
 	p.mu.Unlock()
 	return transport
