@@ -6,7 +6,6 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -130,6 +129,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
+	body = sanitizeClaudeThinkingBlocks(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
 	if countCacheControls(body) == 0 {
@@ -296,6 +296,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
+	body = sanitizeClaudeThinkingBlocks(body)
 
 	// Auto-inject cache_control if missing (optimization for ClawdBot/clients without caching support)
 	if countCacheControls(body) == 0 {
@@ -470,6 +471,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	body = checkSystemInstructions(body)
+	body = sanitizeClaudeThinkingBlocks(body)
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
 	body = enforceCacheControlLimit(body, 4)
@@ -633,6 +635,106 @@ func disableThinkingIfToolChoiceForced(body []byte) []byte {
 		}
 	}
 	return body
+}
+
+// sanitizeClaudeThinkingBlocks removes assistant thinking blocks whose signatures
+// are missing or obviously incompatible with Anthropic's validation rules.
+//
+// This protects multi-turn Claude-compatible sessions when the previous assistant
+// turn came from a different backend (for example Gemini/OpenAI-compatible
+// providers) and the client replays unsigned or synthetic thinking blocks back to
+// Anthropic. Anthropic rejects those with:
+//   invalid `signature` in `thinking` block
+func sanitizeClaudeThinkingBlocks(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+
+	modified := false
+	for msgIdx, msg := range messages.Array() {
+		if msg.Get("role").String() != "assistant" {
+			continue
+		}
+		content := msg.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			continue
+		}
+
+		var keepBlocks []any
+		removed := 0
+		for _, block := range content.Array() {
+			if block.Get("type").String() != "thinking" {
+				keepBlocks = append(keepBlocks, block.Value())
+				continue
+			}
+			sig := strings.TrimSpace(block.Get("signature").String())
+			if isAnthropicThinkingSignature(sig) {
+				keepBlocks = append(keepBlocks, block.Value())
+				continue
+			}
+			removed++
+		}
+
+		if removed == 0 {
+			continue
+		}
+		if len(keepBlocks) == 0 {
+			keepBlocks = []any{}
+		}
+		body, _ = sjson.SetBytes(body, fmt.Sprintf("messages.%d.content", msgIdx), keepBlocks)
+		modified = true
+	}
+
+	if modified {
+		log.Debug("claude executor: removed assistant thinking blocks with invalid signatures")
+	}
+	return body
+}
+
+// hasSignedAssistantThinking reports whether `messages` already contains an
+// assistant `thinking` block with a non-empty `signature` — i.e., the current
+// request is a continuation turn replaying prior extended-thinking output.
+func hasSignedAssistantThinking(body []byte) bool {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return false
+	}
+	found := false
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		if msg.Get("role").String() != "assistant" {
+			return true
+		}
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(_, block gjson.Result) bool {
+			if block.Get("type").String() != "thinking" {
+				return true
+			}
+			if strings.TrimSpace(block.Get("signature").String()) != "" {
+				found = true
+				return false
+			}
+			return true
+		})
+		return !found
+	})
+	return found
+}
+
+func isAnthropicThinkingSignature(sig string) bool {
+	if sig == "" {
+		return false
+	}
+	if strings.Contains(sig, "#") {
+		return false
+	}
+	if sig == "skip_thought_signature_validator" {
+		return false
+	}
+	return len(sig) >= 50
 }
 
 type compositeReadCloser struct {
@@ -1191,15 +1293,16 @@ func generateBillingHeader(payload []byte, version string) string {
 	if version == "" {
 		version = "2.1.63"
 	}
-	// Generate a deterministic cch hash from the payload content (system + messages + tools).
-	// Real Claude Code uses a 5-char hex hash that varies per request.
-	h := sha256.Sum256(payload)
-	cch := hex.EncodeToString(h[:])[:5]
-
-	// Build hash: 3-char hex, matches the pattern seen in real requests (e.g. "a43")
-	buildBytes := make([]byte, 2)
-	_, _ = rand.Read(buildBytes)
-	buildHash := hex.EncodeToString(buildBytes)[:3]
+	// Derive cch/buildHash from session-stable fields (system + tools) only.
+	// Excluding `messages` keeps the injected billing header byte-identical across
+	// every turn in the same conversation, which is required for Anthropic's
+	// extended-thinking signature to validate on replay: a drifting system prompt
+	// between turns produces "Invalid signature in thinking block" (400).
+	sysBytes := gjson.GetBytes(payload, "system").Raw
+	toolBytes := gjson.GetBytes(payload, "tools").Raw
+	sessionDigest := sha256.Sum256([]byte(sysBytes + "|" + toolBytes))
+	cch := hex.EncodeToString(sessionDigest[:])[:5]
+	buildHash := hex.EncodeToString(sessionDigest[:])[5:8]
 
 	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=cli; cch=%s;", version, buildHash, cch)
 }
@@ -1316,7 +1419,15 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	if cfg != nil {
 		billingVersion = extractVersionFromUA(cfg.ClaudeHeaderDefaults.UserAgent)
 	}
-	payload = checkSystemInstructionsWithMode(payload, strictMode, billingVersion)
+	// Skip system-prompt rewriting for continuation turns that replay a signed
+	// assistant `thinking` block. Anthropic validates the signature against the
+	// system+tools context seen when the thinking was generated; re-injecting the
+	// billing/agent blocks on follow-up turns risks drift and a 400
+	// "Invalid signature in thinking block". The first turn (no signed thinking
+	// yet) still gets the full cloaking treatment.
+	if !hasSignedAssistantThinking(payload) {
+		payload = checkSystemInstructionsWithMode(payload, strictMode, billingVersion)
+	}
 
 	// Inject fake user ID
 	payload = injectFakeUserID(payload, apiKey, cacheUserID)
