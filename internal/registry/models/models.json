@@ -2506,6 +2506,40 @@
   ],
   "antigravity": [
     {
+      "id": "claude-opus-4-7-thinking",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Claude Opus 4.7 (Thinking)",
+      "name": "claude-opus-4-7-thinking",
+      "description": "Claude Opus 4.7 (Thinking)",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "min": 1024,
+        "max": 128000,
+        "zero_allowed": true,
+        "dynamic_allowed": true
+      }
+    },
+    {
+      "id": "claude-opus-4-7",
+      "object": "model",
+      "owned_by": "antigravity",
+      "type": "antigravity",
+      "display_name": "Claude Opus 4.7",
+      "name": "claude-opus-4-7",
+      "description": "Claude Opus 4.7",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "min": 1024,
+        "max": 128000,
+        "zero_allowed": true,
+        "dynamic_allowed": true
+      }
+    },
+    {
       "id": "claude-opus-4-6-thinking",
       "object": "model",
       "owned_by": "antigravity",

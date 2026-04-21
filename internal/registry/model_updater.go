@@ -335,7 +335,6 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 		{name: "codex-team", models: data.CodexTeam},
 		{name: "codex-plus", models: data.CodexPlus},
 		{name: "codex-pro", models: data.CodexPro},
-		{name: "qwen", models: data.Qwen},
 		{name: "iflow", models: data.IFlow},
 		{name: "kimi", models: data.Kimi},
 		{name: "antigravity", models: data.Antigravity},
@@ -346,7 +345,19 @@ func validateModelsCatalog(data *staticModelsJSON) error {
 			return err
 		}
 	}
+	// qwen is optional — upstream removed it; validate only if present.
+	if err := validateOptionalModelSection("qwen", data.Qwen); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateOptionalModelSection validates a section that may legally be empty.
+func validateOptionalModelSection(section string, models []*ModelInfo) error {
+	if len(models) == 0 {
+		return nil
+	}
+	return validateModelSection(section, models)
 }
 
 func validateModelSection(section string, models []*ModelInfo) error {
