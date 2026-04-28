@@ -53,7 +53,14 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		if transport := cachedTransportForProxyURL(proxyURL); transport != nil {
 			return newProxyHTTPClient(transport, timeout)
 		}
+		// Explicit proxy URL was provided but failed to build. Respect user's
+		// intent to override environment proxy by falling back to context transport
+		// or default, NOT environment proxy.
 		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyURL)
+		if contextTransport != nil {
+			return newProxyHTTPClient(contextTransport, timeout)
+		}
+		return newProxyHTTPClient(nil, timeout)
 	}
 
 	if environmentProxyConfigured() {

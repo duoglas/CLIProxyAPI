@@ -55,6 +55,17 @@ func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
 func TestNewProxyAwareHTTPClientNoProxyReusesSharedClient(t *testing.T) {
 	t.Parallel()
 
+	// Clear environment proxy to ensure test isolation
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+		old := os.Getenv(key)
+		os.Unsetenv(key)
+		defer func(k, v string) {
+			if v != "" {
+				os.Setenv(k, v)
+			}
+		}(key, old)
+	}
+
 	first := newProxyAwareHTTPClient(context.Background(), nil, nil, 0)
 	second := newProxyAwareHTTPClient(context.Background(), nil, nil, 0)
 
@@ -209,6 +220,17 @@ func TestNewProxyAwareHTTPClientReusesEnvironmentProxyTransport(t *testing.T) {
 }
 
 func TestNewProxyAwareHTTPClientNoProxyDoesNotLeakAntigravityTransportMutation(t *testing.T) {
+	// Clear environment proxy to ensure test isolation
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"} {
+		old := os.Getenv(key)
+		os.Unsetenv(key)
+		defer func(k, v string) {
+			if v != "" {
+				os.Setenv(k, v)
+			}
+		}(key, old)
+	}
+
 	client := newAntigravityHTTPClient(context.Background(), nil, nil, 0)
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok {
