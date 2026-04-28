@@ -804,7 +804,7 @@ func TestRemapOAuthToolNames_PreservesRenamesWhenFilteringTools(t *testing.T) {
 		}]
 	}`)
 
-	out := remapOAuthToolNames(body)
+	out, _ := remapOAuthToolNames(body)
 
 	if got := gjson.GetBytes(out, "tools.#").Int(); got != 4 {
 		t.Fatalf("tools count = %d, want %d", got, 4)
@@ -838,7 +838,7 @@ func TestRemapOAuthToolNames_MapsQuestionToolChoiceInsteadOfRemoving(t *testing.
 		"tool_choice":{"type":"tool","name":"question"}
 	}`)
 
-	out := remapOAuthToolNames(body)
+	out, _ := remapOAuthToolNames(body)
 
 	if !gjson.GetBytes(out, "tool_choice").Exists() {
 		t.Fatalf("tool_choice should be preserved for mapped tool: %s", string(out))
@@ -869,7 +869,7 @@ func TestRemapOAuthToolNames_WithoutToolsStillRewritesMessageReferences(t *testi
 		}]
 	}`)
 
-	out := remapOAuthToolNames(body)
+	out, _ := remapOAuthToolNames(body)
 
 	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "Skill" {
 		t.Fatalf("tool_choice.name = %q, want %q", got, "Skill")
