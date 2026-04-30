@@ -220,6 +220,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		var retryAfter *time.Duration
+		if httpResp.StatusCode == http.StatusTooManyRequests {
+			retryAfter = parseClaudeRetryAfter(httpResp.Header)
+		}
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
 		// and let decodeResponseBody handle both header-declared and magic-byte-detected
 		// compression.  This keeps error-path behaviour consistent with the success path.
@@ -228,7 +232,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 			recordAPIResponseError(ctx, e.cfg, decErr)
 			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
 			logWithRequestID(ctx).Warn(msg)
-			return resp, statusErr{code: httpResp.StatusCode, msg: msg}
+			return resp, statusErr{code: httpResp.StatusCode, msg: msg, retryAfter: retryAfter}
 		}
 		b, readErr := io.ReadAll(errBody)
 		if readErr != nil {
@@ -239,7 +243,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		}
 		appendAPIResponseChunk(ctx, e.cfg, b)
 		logWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: retryAfter}
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
@@ -391,6 +395,10 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		var retryAfter *time.Duration
+		if httpResp.StatusCode == http.StatusTooManyRequests {
+			retryAfter = parseClaudeRetryAfter(httpResp.Header)
+		}
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
 		// and let decodeResponseBody handle both header-declared and magic-byte-detected
 		// compression.  This keeps error-path behaviour consistent with the success path.
@@ -399,7 +407,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			recordAPIResponseError(ctx, e.cfg, decErr)
 			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
 			logWithRequestID(ctx).Warn(msg)
-			return nil, statusErr{code: httpResp.StatusCode, msg: msg}
+			return nil, statusErr{code: httpResp.StatusCode, msg: msg, retryAfter: retryAfter}
 		}
 		b, readErr := io.ReadAll(errBody)
 		if readErr != nil {
@@ -413,7 +421,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
+		err = statusErr{code: httpResp.StatusCode, msg: string(b), retryAfter: retryAfter}
 		return nil, err
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, httpResp.Header.Get("Content-Encoding"))
@@ -566,6 +574,10 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, resp.StatusCode, resp.Header.Clone())
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var retryAfter *time.Duration
+		if resp.StatusCode == http.StatusTooManyRequests {
+			retryAfter = parseClaudeRetryAfter(resp.Header)
+		}
 		// Decompress error responses — pass the Content-Encoding value (may be empty)
 		// and let decodeResponseBody handle both header-declared and magic-byte-detected
 		// compression.  This keeps error-path behaviour consistent with the success path.
@@ -574,7 +586,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 			recordAPIResponseError(ctx, e.cfg, decErr)
 			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
 			logWithRequestID(ctx).Warn(msg)
-			return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: msg}
+			return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: msg, retryAfter: retryAfter}
 		}
 		b, readErr := io.ReadAll(errBody)
 		if readErr != nil {
@@ -587,7 +599,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		if errClose := errBody.Close(); errClose != nil {
 			log.Errorf("response body close error: %v", errClose)
 		}
-		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b)}
+		return cliproxyexecutor.Response{}, statusErr{code: resp.StatusCode, msg: string(b), retryAfter: retryAfter}
 	}
 	decodedBody, err := decodeResponseBody(resp.Body, resp.Header.Get("Content-Encoding"))
 	if err != nil {
