@@ -67,30 +67,13 @@ func TestSanitizedToolNameMap(t *testing.T) {
 			t.Fatal("expected non-nil map")
 		}
 		if m["mcp_server_read"] != "mcp/server/read" {
-			t.Errorf("expected mcp_server_read -> mcp/server/read, got %q", m["mcp_server_read"])
+			t.Errorf("expected mcp_server_read → mcp/server/read, got %q", m["mcp_server_read"])
 		}
 		if m["tool_v2"] != "tool@v2" {
-			t.Errorf("expected tool_v2 -> tool@v2, got %q", m["tool_v2"])
+			t.Errorf("expected tool_v2 → tool@v2, got %q", m["tool_v2"])
 		}
 		if _, exists := m["valid_tool"]; exists {
-			t.Error("valid_tool should not be in the map")
-		}
-	})
-
-	t.Run("supports OpenAI tool format", func(t *testing.T) {
-		raw := []byte(`{"tools":[
-			{"type":"function","function":{"name":"mcp/server/read","parameters":{"type":"object"}}},
-			{"type":"function","function":{"name":"valid_tool","parameters":{"type":"object"}}}
-		]}`)
-		m := SanitizedToolNameMap(raw)
-		if m == nil {
-			t.Fatal("expected non-nil map")
-		}
-		if m["mcp_server_read"] != "mcp/server/read" {
-			t.Errorf("expected mcp_server_read -> mcp/server/read, got %q", m["mcp_server_read"])
-		}
-		if _, exists := m["valid_tool"]; exists {
-			t.Error("valid_tool should not be in the map")
+			t.Error("valid_tool should not be in the map (no sanitization needed)")
 		}
 	})
 
@@ -102,7 +85,7 @@ func TestSanitizedToolNameMap(t *testing.T) {
 		}
 	})
 
-	t.Run("returns nil for empty or missing tools", func(t *testing.T) {
+	t.Run("returns nil for empty/missing tools", func(t *testing.T) {
 		if m := SanitizedToolNameMap([]byte(`{}`)); m != nil {
 			t.Error("expected nil for no tools")
 		}

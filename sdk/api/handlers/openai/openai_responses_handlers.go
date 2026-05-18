@@ -13,12 +13,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 
 	"github.com/gin-gonic/gin"
-	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -45,7 +46,10 @@ func writeResponsesSSEChunk(w io.Writer, chunk []byte) {
 }
 
 type responsesSSEFramer struct {
-	pending []byte
+	pending              []byte
+	outputItems          map[int][]byte
+	outputOrder          []int
+	unindexedOutputItems [][]byte
 }
 
 func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
@@ -61,7 +65,7 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 		if frameLen == 0 {
 			break
 		}
-		writeResponsesSSEChunk(w, f.pending[:frameLen])
+		f.writeFrame(w, f.pending[:frameLen])
 		copy(f.pending, f.pending[frameLen:])
 		f.pending = f.pending[:len(f.pending)-frameLen]
 	}
@@ -72,7 +76,7 @@ func (f *responsesSSEFramer) WriteChunk(w io.Writer, chunk []byte) {
 	if len(f.pending) == 0 || !responsesSSECanEmitWithoutDelimiter(f.pending) {
 		return
 	}
-	writeResponsesSSEChunk(w, f.pending)
+	f.writeFrame(w, f.pending)
 	f.pending = f.pending[:0]
 }
 
@@ -88,8 +92,131 @@ func (f *responsesSSEFramer) Flush(w io.Writer) {
 		f.pending = f.pending[:0]
 		return
 	}
-	writeResponsesSSEChunk(w, f.pending)
+	f.writeFrame(w, f.pending)
 	f.pending = f.pending[:0]
+}
+
+func (f *responsesSSEFramer) writeFrame(w io.Writer, frame []byte) {
+	writeResponsesSSEChunk(w, f.repairFrame(frame))
+}
+
+func (f *responsesSSEFramer) repairFrame(frame []byte) []byte {
+	payload, ok := responsesSSEDataPayload(frame)
+	if !ok || len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !json.Valid(payload) {
+		return frame
+	}
+
+	switch gjson.GetBytes(payload, "type").String() {
+	case "response.output_item.done":
+		f.recordOutputItem(payload)
+	case "response.completed":
+		repaired := f.repairCompletedPayload(payload)
+		if !bytes.Equal(repaired, payload) {
+			return responsesSSEFrameWithData(frame, repaired)
+		}
+	}
+	return frame
+}
+
+func responsesSSEDataPayload(frame []byte) ([]byte, bool) {
+	var payload []byte
+	found := false
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		trimmed := bytes.TrimSpace(line)
+		if !bytes.HasPrefix(trimmed, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(trimmed[len("data:"):])
+		if found {
+			payload = append(payload, '\n')
+		}
+		payload = append(payload, data...)
+		found = true
+	}
+	return payload, found
+}
+
+func responsesSSEFrameWithData(frame, payload []byte) []byte {
+	var out bytes.Buffer
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 || bytes.HasPrefix(trimmed, []byte("data:")) {
+			continue
+		}
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+	for _, line := range bytes.Split(payload, []byte("\n")) {
+		out.WriteString("data: ")
+		out.Write(line)
+		out.WriteByte('\n')
+	}
+	out.WriteByte('\n')
+	return out.Bytes()
+}
+
+func (f *responsesSSEFramer) recordOutputItem(payload []byte) {
+	item := gjson.GetBytes(payload, "item")
+	if !item.Exists() || !item.IsObject() || item.Get("type").String() == "" {
+		return
+	}
+
+	if outputIndex := gjson.GetBytes(payload, "output_index"); outputIndex.Exists() {
+		index := int(outputIndex.Int())
+		if f.outputItems == nil {
+			f.outputItems = make(map[int][]byte)
+		}
+		if _, exists := f.outputItems[index]; !exists {
+			f.outputOrder = append(f.outputOrder, index)
+		}
+		f.outputItems[index] = append([]byte(nil), item.Raw...)
+		return
+	}
+
+	f.unindexedOutputItems = append(f.unindexedOutputItems, append([]byte(nil), item.Raw...))
+}
+
+func (f *responsesSSEFramer) repairCompletedPayload(payload []byte) []byte {
+	if len(f.outputOrder) == 0 && len(f.unindexedOutputItems) == 0 {
+		return payload
+	}
+	output := gjson.GetBytes(payload, "response.output")
+	if output.Exists() && (!output.IsArray() || len(output.Array()) > 0) {
+		return payload
+	}
+
+	var outputJSON bytes.Buffer
+	outputJSON.WriteByte('[')
+	indexes := append([]int(nil), f.outputOrder...)
+	sort.Ints(indexes)
+	written := 0
+	for _, index := range indexes {
+		item, ok := f.outputItems[index]
+		if !ok {
+			continue
+		}
+		if written > 0 {
+			outputJSON.WriteByte(',')
+		}
+		outputJSON.Write(item)
+		written++
+	}
+	for _, item := range f.unindexedOutputItems {
+		if written > 0 {
+			outputJSON.WriteByte(',')
+		}
+		outputJSON.Write(item)
+		written++
+	}
+	outputJSON.WriteByte(']')
+
+	repaired, err := sjson.SetRawBytes(payload, "response.output", outputJSON.Bytes())
+	if err != nil {
+		return payload
+	}
+	return repaired
 }
 
 func responsesSSEFrameLen(chunk []byte) int {
@@ -193,11 +320,11 @@ func responsesSSENeedsLineBreak(pending, chunk []byte) bool {
 	}
 	return false
 }
+
 // OpenAIResponsesAPIHandler contains the handlers for OpenAIResponses API endpoints.
 // It holds a pool of clients to interact with the backend service.
 type OpenAIResponsesAPIHandler struct {
 	*handlers.BaseAPIHandler
-	turnState responsesTurnStateCache
 }
 
 // NewOpenAIResponsesAPIHandler creates a new OpenAIResponses API handlers instance.
@@ -243,7 +370,7 @@ func (h *OpenAIResponsesAPIHandler) OpenAIResponsesModels(c *gin.Context) {
 // Parameters:
 //   - c: The Gin context containing the HTTP request and response
 func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
-	rawJSON, err := c.GetRawData()
+	rawJSON, err := handlers.ReadRequestBody(c)
 	// If data retrieval fails, return a 400 Bad Request error.
 	if err != nil {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
@@ -252,12 +379,6 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 				Type:    "invalid_request_error",
 			},
 		})
-		return
-	}
-
-	rawJSON, errMsg := h.normalizeContinuationRequest(rawJSON)
-	if errMsg != nil {
-		h.WriteErrorResponse(c, errMsg)
 		return
 	}
 
@@ -272,7 +393,7 @@ func (h *OpenAIResponsesAPIHandler) Responses(c *gin.Context) {
 }
 
 func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
-	rawJSON, err := c.GetRawData()
+	rawJSON, err := handlers.ReadRequestBody(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
@@ -310,7 +431,6 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 		cliCancel(errMsg.Error)
 		return
 	}
-	h.rememberCompletedResponse(rawJSON, resp)
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
@@ -337,7 +457,6 @@ func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, r
 		cliCancel(errMsg.Error)
 		return
 	}
-	h.rememberCompletedResponse(rawJSON, resp)
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
@@ -412,24 +531,22 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 
 			// Write first chunk logic (matching forwardResponsesStream)
-			h.rememberCompletedResponseFromChunk(rawJSON, chunk)
 			framer.WriteChunk(c.Writer, chunk)
 			flusher.Flush()
 
 			// Continue
-			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, rawJSON, dataChan, errChan, framer)
+			h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
 			return
 		}
 	}
 }
 
-func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), requestJSON []byte, data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer) {
+func (h *OpenAIResponsesAPIHandler) forwardResponsesStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, framer *responsesSSEFramer) {
 	if framer == nil {
 		framer = &responsesSSEFramer{}
 	}
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
 		WriteChunk: func(chunk []byte) {
-			h.rememberCompletedResponseFromChunk(requestJSON, chunk)
 			framer.WriteChunk(c.Writer, chunk)
 		},
 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {

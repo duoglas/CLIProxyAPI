@@ -1,37 +1,20 @@
 package handlers
 
 import (
-	"context"
-	"net/http/httptest"
 	"testing"
 
-	"github.com/gin-gonic/gin"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"golang.org/x/net/context"
 )
 
-func TestRequestExecutionMetadata_OmitsIdempotencyKeyWhenHeaderMissing(t *testing.T) {
-	t.Parallel()
+func TestRequestExecutionMetadataIncludesExecutionSessionWithoutIdempotencyKey(t *testing.T) {
+	ctx := WithExecutionSessionID(context.Background(), "session-1")
 
-	gin.SetMode(gin.TestMode)
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	ctx.Request = httptest.NewRequest("POST", "/v1/responses", nil)
-
-	meta := requestExecutionMetadata(context.WithValue(context.Background(), "gin", ctx))
-	if len(meta) != 0 {
-		t.Fatalf("requestExecutionMetadata() = %#v, want empty metadata", meta)
+	meta := requestExecutionMetadata(ctx)
+	if got := meta[coreexecutor.ExecutionSessionMetadataKey]; got != "session-1" {
+		t.Fatalf("ExecutionSessionMetadataKey = %v, want %q", got, "session-1")
 	}
-}
-
-func TestRequestExecutionMetadata_ForwardsIdempotencyKeyWhenPresent(t *testing.T) {
-	t.Parallel()
-
-	gin.SetMode(gin.TestMode)
-	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
-	req := httptest.NewRequest("POST", "/v1/responses", nil)
-	req.Header.Set("Idempotency-Key", "abc-123")
-	ctx.Request = req
-
-	meta := requestExecutionMetadata(context.WithValue(context.Background(), "gin", ctx))
-	if got := meta[idempotencyKeyMetadataKey]; got != "abc-123" {
-		t.Fatalf("requestExecutionMetadata() idempotency key = %#v, want %q", got, "abc-123")
+	if _, ok := meta[idempotencyKeyMetadataKey]; ok {
+		t.Fatalf("unexpected idempotency key in metadata: %v", meta[idempotencyKeyMetadataKey])
 	}
 }

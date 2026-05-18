@@ -37,14 +37,6 @@ var signatureCache sync.Map
 // cacheCleanupOnce ensures the background cleanup goroutine starts only once
 var cacheCleanupOnce sync.Once
 
-var signatureCacheEnabled atomic.Bool
-var signatureBypassStrictMode atomic.Bool
-
-func init() {
-	signatureCacheEnabled.Store(true)
-	signatureBypassStrictMode.Store(false)
-}
-
 // groupCache is the inner map type
 type groupCache struct {
 	mu      sync.RWMutex
@@ -203,6 +195,14 @@ func GetModelGroup(modelName string) string {
 		return "gemini"
 	}
 	return modelName
+}
+
+var signatureCacheEnabled atomic.Bool
+var signatureBypassStrictMode atomic.Bool
+
+func init() {
+	signatureCacheEnabled.Store(true)
+	signatureBypassStrictMode.Store(false)
 }
 
 // SetSignatureCacheEnabled switches Antigravity signature handling between cache mode and bypass mode.

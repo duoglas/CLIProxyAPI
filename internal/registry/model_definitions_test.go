@@ -2,74 +2,139 @@ package registry
 
 import "testing"
 
-func TestCodexModelsIncludeBuiltInGPTImage(t *testing.T) {
-	tests := []struct {
-		name   string
-		models func() []*ModelInfo
-	}{
-		{name: "free", models: GetCodexFreeModels},
-		{name: "team", models: GetCodexTeamModels},
-		{name: "plus", models: GetCodexPlusModels},
-		{name: "pro", models: GetCodexProModels},
+func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
+	tierModels := map[string][]*ModelInfo{
+		"free": GetCodexFreeModels(),
+		"team": GetCodexTeamModels(),
+		"plus": GetCodexPlusModels(),
+		"pro":  GetCodexProModels(),
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var foundImage *ModelInfo
-			var foundMain *ModelInfo
-			for _, model := range tt.models() {
-				if model == nil {
-					continue
-				}
-				switch model.ID {
-				case codexBuiltinImageModelID:
-					foundImage = model
-				case codexBuiltinImageMainModelID:
-					foundMain = model
-				}
+	for tier, models := range tierModels {
+		t.Run(tier, func(t *testing.T) {
+			model := findModelInfo(models, "gpt-5.5")
+			if model == nil {
+				t.Fatalf("expected codex %s tier to include gpt-5.5", tier)
 			}
-			if foundImage == nil {
-				t.Fatalf("expected %s in codex %s models", codexBuiltinImageModelID, tt.name)
-			}
-			if foundMain == nil {
-				t.Fatalf("expected %s in codex %s models", codexBuiltinImageMainModelID, tt.name)
-			}
-			if foundImage.Type != "openai" {
-				t.Fatalf("type = %q, want %q", foundImage.Type, "openai")
-			}
-			if foundImage.DisplayName != "GPT Image 2" {
-				t.Fatalf("display_name = %q, want %q", foundImage.DisplayName, "GPT Image 2")
-			}
-			if foundMain.DisplayName != "GPT 5.4 Mini" {
-				t.Fatalf("display_name = %q, want %q", foundMain.DisplayName, "GPT 5.4 Mini")
-			}
+			assertGPT55ModelInfo(t, tier, model)
 		})
 	}
+
+	model := LookupStaticModelInfo("gpt-5.5")
+	if model == nil {
+		t.Fatal("expected LookupStaticModelInfo to find gpt-5.5")
+	}
+	assertGPT55ModelInfo(t, "lookup", model)
 }
 
-func TestLookupStaticModelInfoIncludesCodexBuiltIns(t *testing.T) {
-	for _, id := range []string{codexBuiltinImageMainModelID, codexBuiltinImageModelID} {
-		info := LookupStaticModelInfo(id)
-		if info == nil {
-			t.Fatalf("expected lookup for %s to succeed", id)
+func TestWithXAIBuiltinsAddsVideoModel(t *testing.T) {
+	models := WithXAIBuiltins(nil)
+	found := false
+	for _, model := range models {
+		if model != nil && model.ID == xaiBuiltinVideoModelID {
+			found = true
+			if model.OwnedBy != "xai" {
+				t.Fatalf("OwnedBy = %q, want xai", model.OwnedBy)
+			}
 		}
-		if info.ID != id {
-			t.Fatalf("id = %q, want %q", info.ID, id)
-		}
-		if info.Type != "openai" {
-			t.Fatalf("type = %q, want %q", info.Type, "openai")
-		}
+	}
+	if !found {
+		t.Fatalf("expected %s builtin model", xaiBuiltinVideoModelID)
 	}
 }
 
-func TestLookupStaticModelInfoIncludesSyncedCatalogEntries(t *testing.T) {
-	for _, id := range []string{"claude-opus-4-7", "kimi-k2.6"} {
-		info := LookupStaticModelInfo(id)
-		if info == nil {
-			t.Fatalf("expected lookup for %s to succeed", id)
+func TestValidateModelsCatalogAllowsMissingSections(t *testing.T) {
+	data := validTestModelsCatalog()
+	data.XAI = nil
+
+	if err := validateModelsCatalog(data); err != nil {
+		t.Fatalf("validateModelsCatalog() error = %v", err)
+	}
+}
+
+func TestValidateModelsCatalogRejectsInvalidDefinitions(t *testing.T) {
+	data := validTestModelsCatalog()
+	data.Claude = []*ModelInfo{{ID: ""}}
+
+	if err := validateModelsCatalog(data); err == nil {
+		t.Fatal("expected invalid model definition error")
+	}
+}
+
+func validTestModelsCatalog() *staticModelsJSON {
+	models := []*ModelInfo{{ID: "test-model"}}
+	return &staticModelsJSON{
+		Claude:      models,
+		Gemini:      models,
+		Vertex:      models,
+		GeminiCLI:   models,
+		AIStudio:    models,
+		CodexFree:   models,
+		CodexTeam:   models,
+		CodexPlus:   models,
+		CodexPro:    models,
+		Kimi:        models,
+		Antigravity: models,
+		XAI:         models,
+	}
+}
+
+func findModelInfo(models []*ModelInfo, id string) *ModelInfo {
+	for _, model := range models {
+		if model != nil && model.ID == id {
+			return model
 		}
-		if info.ID != id {
-			t.Fatalf("id = %q, want %q", info.ID, id)
+	}
+	return nil
+}
+
+func assertGPT55ModelInfo(t *testing.T, source string, model *ModelInfo) {
+	t.Helper()
+
+	if model.ID != "gpt-5.5" {
+		t.Fatalf("%s id mismatch: got %q", source, model.ID)
+	}
+	if model.Object != "model" {
+		t.Fatalf("%s object mismatch: got %q", source, model.Object)
+	}
+	if model.Created != 1776902400 {
+		t.Fatalf("%s created timestamp mismatch: got %d", source, model.Created)
+	}
+	if model.OwnedBy != "openai" {
+		t.Fatalf("%s owned_by mismatch: got %q", source, model.OwnedBy)
+	}
+	if model.Type != "openai" {
+		t.Fatalf("%s type mismatch: got %q", source, model.Type)
+	}
+	if model.DisplayName != "GPT 5.5" {
+		t.Fatalf("%s display name mismatch: got %q", source, model.DisplayName)
+	}
+	if model.Version != "gpt-5.5" {
+		t.Fatalf("%s version mismatch: got %q", source, model.Version)
+	}
+	if model.Description != "Frontier model for complex coding, research, and real-world work." {
+		t.Fatalf("%s description mismatch: got %q", source, model.Description)
+	}
+	if model.ContextLength != 272000 {
+		t.Fatalf("%s context length mismatch: got %d", source, model.ContextLength)
+	}
+	if model.MaxCompletionTokens != 128000 {
+		t.Fatalf("%s max completion tokens mismatch: got %d", source, model.MaxCompletionTokens)
+	}
+	if len(model.SupportedParameters) != 1 || model.SupportedParameters[0] != "tools" {
+		t.Fatalf("%s supported parameters mismatch: got %v", source, model.SupportedParameters)
+	}
+	if model.Thinking == nil {
+		t.Fatalf("%s missing thinking support", source)
+	}
+
+	want := []string{"low", "medium", "high", "xhigh"}
+	if len(model.Thinking.Levels) != len(want) {
+		t.Fatalf("%s thinking level count mismatch: got %d, want %d", source, len(model.Thinking.Levels), len(want))
+	}
+	for i, level := range want {
+		if model.Thinking.Levels[i] != level {
+			t.Fatalf("%s thinking level %d mismatch: got %q, want %q", source, i, model.Thinking.Levels[i], level)
 		}
 	}
 }

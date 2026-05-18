@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -193,26 +193,6 @@ func (h *Handler) PutUsageStatisticsEnabled(c *gin.Context) {
 	h.updateBoolField(c, func(v bool) { h.cfg.UsageStatisticsEnabled = v })
 }
 
-// UsageStatisticsPersistIntervalSeconds
-func (h *Handler) GetUsageStatisticsPersistIntervalSeconds(c *gin.Context) {
-	c.JSON(200, gin.H{"usage-statistics-persist-interval-seconds": h.cfg.UsageStatisticsPersistIntervalSeconds})
-}
-func (h *Handler) PutUsageStatisticsPersistIntervalSeconds(c *gin.Context) {
-	var body struct {
-		Value *int `json:"value"`
-	}
-	if errBindJSON := c.ShouldBindJSON(&body); errBindJSON != nil || body.Value == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
-		return
-	}
-	value := *body.Value
-	if value < 0 {
-		value = 0
-	}
-	h.cfg.UsageStatisticsPersistIntervalSeconds = value
-	h.persist(c)
-}
-
 // LoggingToFile
 func (h *Handler) GetLoggingToFile(c *gin.Context) {
 	c.JSON(200, gin.H{"logging-to-file": h.cfg.LoggingToFile})
@@ -281,19 +261,6 @@ func (h *Handler) GetRequestRetry(c *gin.Context) {
 }
 func (h *Handler) PutRequestRetry(c *gin.Context) {
 	h.updateIntField(c, func(v int) { h.cfg.RequestRetry = v })
-}
-
-// Max invalid request retries
-func (h *Handler) GetMaxInvalidRequestRetries(c *gin.Context) {
-	c.JSON(200, gin.H{"max-invalid-request-retries": h.cfg.MaxInvalidRequestRetries})
-}
-func (h *Handler) PutMaxInvalidRequestRetries(c *gin.Context) {
-	h.updateIntField(c, func(v int) {
-		if v < 0 {
-			v = 0
-		}
-		h.cfg.MaxInvalidRequestRetries = v
-	})
 }
 
 // Max retry interval

@@ -20,6 +20,7 @@ type SessionCache struct {
 }
 
 // NewSessionCache creates a cache with the specified TTL.
+// A background goroutine periodically cleans expired entries.
 func NewSessionCache(ttl time.Duration) *SessionCache {
 	if ttl <= 0 {
 		ttl = 30 * time.Minute
@@ -34,6 +35,7 @@ func NewSessionCache(ttl time.Duration) *SessionCache {
 }
 
 // Get retrieves the auth ID bound to a session, if still valid.
+// Does NOT refresh the TTL on access.
 func (c *SessionCache) Get(sessionID string) (string, bool) {
 	if sessionID == "" {
 		return "", false
@@ -53,7 +55,8 @@ func (c *SessionCache) Get(sessionID string) (string, bool) {
 	return entry.authID, true
 }
 
-// GetAndRefresh retrieves the auth ID and refreshes the TTL on cache hit.
+// GetAndRefresh retrieves the auth ID bound to a session and refreshes TTL on hit.
+// This extends the binding lifetime for active sessions.
 func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
 	if sessionID == "" {
 		return "", false
@@ -70,6 +73,7 @@ func (c *SessionCache) GetAndRefresh(sessionID string) (string, bool) {
 		c.mu.Unlock()
 		return "", false
 	}
+	// Refresh TTL on successful access
 	entry.expiresAt = now.Add(c.ttl)
 	c.entries[sessionID] = entry
 	c.mu.Unlock()
@@ -99,7 +103,8 @@ func (c *SessionCache) Invalidate(sessionID string) {
 	c.mu.Unlock()
 }
 
-// InvalidateAuth removes all session bindings for a specific auth ID.
+// InvalidateAuth removes all sessions bound to a specific auth ID.
+// Used when an auth becomes unavailable.
 func (c *SessionCache) InvalidateAuth(authID string) {
 	if authID == "" {
 		return

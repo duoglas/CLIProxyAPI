@@ -7,11 +7,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -120,48 +119,5 @@ func TestCodexExecutorCountTokensTreatsNullInstructionsAsEmpty(t *testing.T) {
 
 	if string(nullResp.Payload) != string(emptyResp.Payload) {
 		t.Fatalf("token count payload mismatch:\nnull=%s\nempty=%s", string(nullResp.Payload), string(emptyResp.Payload))
-	}
-}
-
-func TestCodexWebsocketExecuteNormalizesNullInstructions(t *testing.T) {
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	reqBodyCh := make(chan []byte, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade websocket: %v", err)
-			return
-		}
-		defer func() { _ = conn.Close() }()
-
-		_, payload, err := conn.ReadMessage()
-		if err != nil {
-			t.Errorf("read websocket request: %v", err)
-			return
-		}
-		reqBodyCh <- payload
-
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_ws","created_at":0,"model":"gpt-5.4"}}`))
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"resp_ws","status":"completed","model":"gpt-5.4","output":[]}}`))
-	}))
-	defer server.Close()
-
-	auth := newCodexTestAuth(server.URL, "ws-key")
-	auth.Attributes["websockets"] = "true"
-
-	executor := NewCodexWebsocketsExecutor(&config.Config{})
-	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
-		Model:   "gpt-5.4",
-		Payload: []byte(`{"model":"gpt-5.4","instructions":null,"input":"hello"}`),
-	}, cliproxyexecutor.Options{
-		SourceFormat: sdktranslator.FromString("openai-response"),
-	})
-	if err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	payload := <-reqBodyCh
-	if got := gjson.GetBytes(payload, "instructions"); got.Type != gjson.String || got.String() != "" {
-		t.Fatalf("websocket instructions = %s, want empty string", got.Raw)
 	}
 }

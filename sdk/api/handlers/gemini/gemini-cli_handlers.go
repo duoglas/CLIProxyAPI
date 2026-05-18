@@ -15,10 +15,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
+	. "github.com/router-for-me/CLIProxyAPI/v7/internal/constant"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
@@ -48,6 +48,7 @@ func (h *GeminiCLIAPIHandler) Models() []map[string]any {
 }
 
 // CLIHandler handles CLI-specific requests for Gemini API operations.
+// It restricts access to localhost only and routes requests to appropriate internal handlers.
 func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 	if h.Cfg == nil || !h.Cfg.EnableGeminiCLIEndpoint {
 		c.JSON(http.StatusForbidden, handlers.ErrorResponse{
@@ -58,7 +59,14 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 		})
 		return
 	}
-	if !isLocalGeminiCLIRequest(c.Request) {
+
+	requestHost := c.Request.Host
+	requestHostname := requestHost
+	if hostname, _, errSplitHostPort := net.SplitHostPort(requestHost); errSplitHostPort == nil {
+		requestHostname = hostname
+	}
+
+	if !strings.HasPrefix(c.Request.RemoteAddr, "127.0.0.1:") || requestHostname != "127.0.0.1" {
 		c.JSON(http.StatusForbidden, handlers.ErrorResponse{
 			Error: handlers.ErrorDetail{
 				Message: "CLI reply only allow local access",
@@ -87,8 +95,8 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 			})
 			return
 		}
-		for key, value := range handlers.FilterUpstreamHeaders(c.Request.Header) {
-			req.Header[key] = append([]string(nil), value...)
+		for key, value := range c.Request.Header {
+			req.Header[key] = value
 		}
 
 		httpClient := util.SetProxy(h.Cfg, &http.Client{})
@@ -125,7 +133,9 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 			_ = resp.Body.Close()
 		}()
 
-		handlers.WriteUpstreamHeaders(c.Writer.Header(), resp.Header)
+		for key, value := range resp.Header {
+			c.Header(key, value[0])
+		}
 		output, err := io.ReadAll(resp.Body)
 		if err != nil {
 			log.Errorf("Failed to read response body: %v", err)
@@ -135,96 +145,6 @@ func (h *GeminiCLIAPIHandler) CLIHandler(c *gin.Context) {
 		_, _ = c.Writer.Write(output)
 		c.Set("API_RESPONSE", output)
 	}
-}
-
-func isLocalGeminiCLIRequest(req *http.Request) bool {
-	if req == nil {
-		return false
-	}
-	remoteHost, _, err := net.SplitHostPort(req.RemoteAddr)
-	if err != nil {
-		return false
-	}
-	remoteIP := net.ParseIP(strings.Trim(remoteHost, "[]"))
-	if remoteIP == nil || !remoteIP.IsLoopback() {
-		return false
-	}
-
-	requestHost := strings.TrimSpace(req.Host)
-	if host, _, err := net.SplitHostPort(requestHost); err == nil {
-		requestHost = host
-	}
-	requestHost = strings.Trim(strings.ToLower(strings.TrimSpace(requestHost)), "[]")
-	if requestHost == "localhost" {
-		return true
-	}
-	hostIP := net.ParseIP(requestHost)
-	return hostIP != nil && hostIP.IsLoopback()
-}
-
-func stripConsumedProxyCredential(req *http.Request, c *gin.Context) {
-	if req == nil || c == nil {
-		return
-	}
-
-	switch accessMetadataSource(c) {
-	case "authorization":
-		req.Header.Del("Authorization")
-	case "x-goog-api-key":
-		req.Header.Del("X-Goog-Api-Key")
-	case "x-api-key":
-		req.Header.Del("X-Api-Key")
-	case "query-key":
-		removeQueryValuesMatching(req, "key", strings.TrimSpace(c.GetString("apiKey")))
-	case "query-auth-token":
-		removeQueryValuesMatching(req, "auth_token", strings.TrimSpace(c.GetString("apiKey")))
-	}
-}
-
-func accessMetadataSource(c *gin.Context) string {
-	if c == nil {
-		return ""
-	}
-	raw, exists := c.Get("accessMetadata")
-	if !exists || raw == nil {
-		return ""
-	}
-	switch typed := raw.(type) {
-	case map[string]string:
-		return strings.TrimSpace(typed["source"])
-	case map[string]any:
-		if source, ok := typed["source"].(string); ok {
-			return strings.TrimSpace(source)
-		}
-	}
-	return ""
-}
-
-func removeQueryValuesMatching(req *http.Request, key string, match string) {
-	if req == nil || req.URL == nil || match == "" {
-		return
-	}
-
-	query := req.URL.Query()
-	values, ok := query[key]
-	if !ok || len(values) == 0 {
-		return
-	}
-
-	kept := make([]string, 0, len(values))
-	for _, value := range values {
-		if value == match {
-			continue
-		}
-		kept = append(kept, value)
-	}
-
-	if len(kept) == 0 {
-		query.Del(key)
-	} else {
-		query[key] = kept
-	}
-	req.URL.RawQuery = query.Encode()
 }
 
 // handleInternalStreamGenerateContent handles streaming content generation requests.
@@ -284,8 +204,7 @@ func (h *GeminiCLIAPIHandler) handleInternalGenerateContent(c *gin.Context, rawJ
 func (h *GeminiCLIAPIHandler) forwardCLIStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
 	var keepAliveInterval *time.Duration
 	if alt != "" {
-		zero := time.Duration(0)
-		keepAliveInterval = &zero
+		keepAliveInterval = new(time.Duration(0))
 	}
 
 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{

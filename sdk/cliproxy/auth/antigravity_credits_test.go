@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type antigravityCreditsFallbackExecutor struct {
@@ -18,17 +18,13 @@ type antigravityCreditsFallbackExecutor struct {
 
 func (e *antigravityCreditsFallbackExecutor) Identifier() string { return "antigravity" }
 
-func (e *antigravityCreditsFallbackExecutor) Execute(ctx context.Context, _ *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if !AntigravityCreditsRequested(ctx) {
-		return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}
-	}
-	return cliproxyexecutor.Response{Payload: []byte("credits fallback: " + req.Model)}, nil
+func (e *antigravityCreditsFallbackExecutor) Execute(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusNotImplemented, Message: "Execute not implemented"}
 }
 
 func (e *antigravityCreditsFallbackExecutor) ExecuteStream(ctx context.Context, _ *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
 	creditsRequested := AntigravityCreditsRequested(ctx)
 	e.streamCreditsRequested = append(e.streamCreditsRequested, creditsRequested)
-
 	ch := make(chan cliproxyexecutor.StreamChunk, 1)
 	if !creditsRequested {
 		ch <- cliproxyexecutor.StreamChunk{Err: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}}
@@ -53,18 +49,16 @@ func (e *antigravityCreditsFallbackExecutor) HttpRequest(context.Context, *Auth,
 }
 
 func TestManagerExecuteStream_AntigravityCreditsFallbackAfterBootstrap429(t *testing.T) {
-	model := "claude-opus-4-6-thinking-" + stringsForTestName(t.Name())
-	authID := "ag-credits-" + stringsForTestName(t.Name())
+	const model = "claude-opus-4-6-thinking"
 	executor := &antigravityCreditsFallbackExecutor{}
 	manager := NewManager(nil, nil, nil)
 	manager.SetConfig(&internalconfig.Config{
 		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
 	})
 	manager.RegisterExecutor(executor)
-
-	registry.GetGlobalRegistry().RegisterClient(authID, "antigravity", []*registry.ModelInfo{{ID: model}})
-	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "antigravity"}); errRegister != nil {
+	registry.GetGlobalRegistry().RegisterClient("ag-credits", "antigravity", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient("ag-credits") })
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "ag-credits", Provider: "antigravity"}); errRegister != nil {
 		t.Fatalf("register auth: %v", errRegister)
 	}
 
@@ -94,31 +88,6 @@ func TestManagerExecuteStream_AntigravityCreditsFallbackAfterBootstrap429(t *tes
 	}
 }
 
-func TestManagerExecute_AntigravityCreditsFallbackAfter429(t *testing.T) {
-	model := "claude-sonnet-4-6-" + stringsForTestName(t.Name())
-	authID := "ag-credits-nonstream-" + stringsForTestName(t.Name())
-	executor := &antigravityCreditsFallbackExecutor{}
-	manager := NewManager(nil, nil, nil)
-	manager.SetConfig(&internalconfig.Config{
-		QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true},
-	})
-	manager.RegisterExecutor(executor)
-
-	registry.GetGlobalRegistry().RegisterClient(authID, "antigravity", []*registry.ModelInfo{{ID: model}})
-	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
-	if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: "antigravity"}); errRegister != nil {
-		t.Fatalf("register auth: %v", errRegister)
-	}
-
-	resp, errExecute := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
-	if errExecute != nil {
-		t.Fatalf("execute: %v", errExecute)
-	}
-	if got := string(resp.Payload); got != "credits fallback: "+model {
-		t.Fatalf("payload = %q, want credits fallback", got)
-	}
-}
-
 func TestStatusCodeFromError_UnwrapsStreamBootstrap429(t *testing.T) {
 	bootstrapErr := newStreamBootstrapError(&Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota exhausted"}, nil)
 	wrappedErr := fmt.Errorf("conductor stream failed: %w", bootstrapErr)
@@ -128,69 +97,58 @@ func TestStatusCodeFromError_UnwrapsStreamBootstrap429(t *testing.T) {
 	}
 }
 
-func TestFindAllAntigravityCreditsCandidateAuths_PrefersKnownCreditsThenUnknown(t *testing.T) {
-	m := &Manager{
-		auths: map[string]*Auth{
-			"zz-credits": {ID: "zz-credits", Provider: "antigravity"},
-			"aa-unknown": {ID: "aa-unknown", Provider: "antigravity"},
-			"mm-no":      {ID: "mm-no", Provider: "antigravity"},
-		},
-		executors: map[string]ProviderExecutor{
-			"antigravity": schedulerTestExecutor{},
+func TestIsAuthBlockedForModel_ClaudeWithCreditsStillBlockedDuringCooldown(t *testing.T) {
+	auth := &Auth{
+		ID:       "ag-1",
+		Provider: "antigravity",
+		ModelStates: map[string]*ModelState{
+			"claude-sonnet-4-6": {
+				Unavailable:    true,
+				NextRetryAfter: time.Now().Add(10 * time.Minute),
+				Quota: QuotaState{
+					Exceeded:      true,
+					NextRecoverAt: time.Now().Add(10 * time.Minute),
+				},
+			},
 		},
 	}
 
-	SetAntigravityCreditsHint("zz-credits", AntigravityCreditsHint{
+	SetAntigravityCreditsHint(auth.ID, AntigravityCreditsHint{
 		Known:     true,
 		Available: true,
 		UpdatedAt: time.Now(),
 	})
-	SetAntigravityCreditsHint("mm-no", AntigravityCreditsHint{
-		Known:     true,
-		Available: false,
-		UpdatedAt: time.Now(),
-	})
 
-	candidates := m.findAllAntigravityCreditsCandidateAuths("claude-sonnet-4-6", cliproxyexecutor.Options{})
-	if len(candidates) != 2 {
-		t.Fatalf("candidates len = %d, want 2", len(candidates))
-	}
-	if candidates[0].auth.ID != "zz-credits" {
-		t.Fatalf("candidates[0].auth.ID = %q, want %q", candidates[0].auth.ID, "zz-credits")
-	}
-	if candidates[1].auth.ID != "aa-unknown" {
-		t.Fatalf("candidates[1].auth.ID = %q, want %q", candidates[1].auth.ID, "aa-unknown")
-	}
-
-	nonClaude := m.findAllAntigravityCreditsCandidateAuths("gemini-3-flash", cliproxyexecutor.Options{})
-	if len(nonClaude) != 0 {
-		t.Fatalf("nonClaude len = %d, want 0", len(nonClaude))
-	}
-
-	pinnedOpts := cliproxyexecutor.Options{
-		Metadata: map[string]any{cliproxyexecutor.PinnedAuthMetadataKey: "aa-unknown"},
-	}
-	pinned := m.findAllAntigravityCreditsCandidateAuths("claude-sonnet-4-6", pinnedOpts)
-	if len(pinned) != 1 {
-		t.Fatalf("pinned len = %d, want 1", len(pinned))
-	}
-	if pinned[0].auth.ID != "aa-unknown" {
-		t.Fatalf("pinned[0].auth.ID = %q, want %q", pinned[0].auth.ID, "aa-unknown")
+	blocked, reason, _ := isAuthBlockedForModel(auth, "claude-sonnet-4-6", time.Now())
+	if !blocked || reason != blockReasonCooldown {
+		t.Fatalf("expected auth to be blocked during cooldown even with credits, got blocked=%v reason=%v", blocked, reason)
 	}
 }
 
-func stringsForTestName(name string) string {
-	out := make([]byte, 0, len(name))
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
-			out = append(out, c)
-			continue
-		}
-		out = append(out, '-')
+func TestIsAuthBlockedForModel_KeepsGeminiBlockedWithoutCreditsBypass(t *testing.T) {
+	auth := &Auth{
+		ID:       "ag-2",
+		Provider: "antigravity",
+		ModelStates: map[string]*ModelState{
+			"gemini-3-flash": {
+				Unavailable:    true,
+				NextRetryAfter: time.Now().Add(10 * time.Minute),
+				Quota: QuotaState{
+					Exceeded:      true,
+					NextRecoverAt: time.Now().Add(10 * time.Minute),
+				},
+			},
+		},
 	}
-	return string(out)
+
+	SetAntigravityCreditsHint(auth.ID, AntigravityCreditsHint{
+		Known:     true,
+		Available: true,
+		UpdatedAt: time.Now(),
+	})
+
+	blocked, reason, _ := isAuthBlockedForModel(auth, "gemini-3-flash", time.Now())
+	if !blocked || reason != blockReasonCooldown {
+		t.Fatalf("expected gemini auth to remain blocked, got blocked=%v reason=%v", blocked, reason)
+	}
 }

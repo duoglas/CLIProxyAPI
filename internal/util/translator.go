@@ -75,17 +75,17 @@ func RenameKey(jsonStr, oldKeyPath, newKeyPath string) (string, error) {
 		return "", fmt.Errorf("old key '%s' does not exist", oldKeyPath)
 	}
 
-	interimJson, err := sjson.SetRaw(jsonStr, newKeyPath, value.Raw)
-	if err != nil {
-		return "", fmt.Errorf("failed to set new key '%s': %w", newKeyPath, err)
+	interimJSON, errSet := sjson.SetRawBytes([]byte(jsonStr), newKeyPath, []byte(value.Raw))
+	if errSet != nil {
+		return "", fmt.Errorf("failed to set new key '%s': %w", newKeyPath, errSet)
 	}
 
-	finalJson, err := sjson.Delete(interimJson, oldKeyPath)
-	if err != nil {
-		return "", fmt.Errorf("failed to delete old key '%s': %w", oldKeyPath, err)
+	finalJSON, errDelete := sjson.DeleteBytes(interimJSON, oldKeyPath)
+	if errDelete != nil {
+		return "", fmt.Errorf("failed to delete old key '%s': %w", oldKeyPath, errDelete)
 	}
 
-	return finalJson, nil
+	return string(finalJSON), nil
 }
 
 // FixJSON converts non-standard JSON that uses single quotes for strings into
@@ -245,6 +245,9 @@ func ToolNameMapFromClaudeRequest(rawJSON []byte) map[string]string {
 	tools.ForEach(func(_, tool gjson.Result) bool {
 		name := strings.TrimSpace(tool.Get("name").String())
 		if name == "" {
+			name = strings.TrimSpace(tool.Get("function.name").String())
+		}
+		if name == "" {
 			return true
 		}
 		key := CanonicalToolName(name)
@@ -273,17 +276,10 @@ func MapToolName(toolNameMap map[string]string, name string) string {
 	return name
 }
 
-func toolDefinitionName(tool gjson.Result) string {
-	name := strings.TrimSpace(tool.Get("name").String())
-	if name != "" {
-		return name
-	}
-	return strings.TrimSpace(tool.Get("function.name").String())
-}
-
-// SanitizedToolNameMap builds a sanitized-name -> original-name map from request tools.
-// It supports both Claude format (tools[].name) and OpenAI format (tools[].function.name).
-// Only entries where sanitization changes the name are included.
+// SanitizedToolNameMap builds a sanitized-name → original-name map from Claude request tools.
+// It is used to restore exact tool names for clients (e.g. Claude Code) after the proxy
+// sanitizes tool names for Gemini/Vertex API compatibility via SanitizeFunctionName.
+// Only entries where sanitization actually changes the name are included.
 func SanitizedToolNameMap(rawJSON []byte) map[string]string {
 	if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
 		return nil
@@ -296,7 +292,7 @@ func SanitizedToolNameMap(rawJSON []byte) map[string]string {
 
 	out := make(map[string]string)
 	tools.ForEach(func(_, tool gjson.Result) bool {
-		name := toolDefinitionName(tool)
+		name := strings.TrimSpace(tool.Get("name").String())
 		if name == "" {
 			return true
 		}
@@ -304,13 +300,11 @@ func SanitizedToolNameMap(rawJSON []byte) map[string]string {
 		if sanitized == name {
 			return true
 		}
-		if existing, exists := out[sanitized]; exists {
-			if existing != name {
-				log.Warnf("tool name sanitization collision: %q and %q -> %q", existing, name, sanitized)
-			}
-			return true
+		if _, exists := out[sanitized]; !exists {
+			out[sanitized] = name
+		} else {
+			log.Warnf("sanitized tool name collision: %q and %q both map to %q, keeping first", out[sanitized], name, sanitized)
 		}
-		out[sanitized] = name
 		return true
 	})
 
@@ -320,13 +314,14 @@ func SanitizedToolNameMap(rawJSON []byte) map[string]string {
 	return out
 }
 
-// RestoreSanitizedToolName returns the original tool name for a sanitized Gemini-safe name.
-// If no mapping exists, the input name is returned unchanged.
+// RestoreSanitizedToolName looks up a sanitized function name in the provided map
+// and returns the original client-facing name. If no mapping exists, it returns
+// the sanitized name unchanged.
 func RestoreSanitizedToolName(toolNameMap map[string]string, sanitizedName string) string {
 	if sanitizedName == "" || toolNameMap == nil {
 		return sanitizedName
 	}
-	if original, ok := toolNameMap[sanitizedName]; ok && original != "" {
+	if original, ok := toolNameMap[sanitizedName]; ok {
 		return original
 	}
 	return sanitizedName

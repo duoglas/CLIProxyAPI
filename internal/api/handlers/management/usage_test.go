@@ -1,131 +1,98 @@
 package management
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 )
 
-func TestGetUsageStatistics_IncludesClientIP(t *testing.T) {
-	t.Setenv("MANAGEMENT_PASSWORD", "")
+func TestGetUsageQueuePopsRequestedRecords(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	withManagementUsageQueue(t, func() {
+		redisqueue.Enqueue([]byte(`{"id":1}`))
+		redisqueue.Enqueue([]byte(`{"id":2}`))
+		redisqueue.Enqueue([]byte(`{"id":3}`))
 
-	stats := internalusage.NewRequestStatistics()
-	recordManagementUsageWithRemoteAddr(t, stats, "198.51.100.7:1234", coreusage.Record{
-		APIKey:      "test-key",
-		Model:       "gpt-5.4",
-		RequestedAt: time.Date(2026, 3, 27, 8, 0, 0, 0, time.UTC),
-		Detail: coreusage.Detail{
-			InputTokens:  11,
-			OutputTokens: 22,
-			TotalTokens:  33,
-		},
+		rec := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(rec)
+		ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
+
+		h := &Handler{}
+		h.GetUsageQueue(ginCtx)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var payload []json.RawMessage
+		if errUnmarshal := json.Unmarshal(rec.Body.Bytes(), &payload); errUnmarshal != nil {
+			t.Fatalf("unmarshal response: %v", errUnmarshal)
+		}
+		if len(payload) != 2 {
+			t.Fatalf("response records = %d, want 2", len(payload))
+		}
+		requireRecordID(t, payload[0], 1)
+		requireRecordID(t, payload[1], 2)
+
+		remaining := redisqueue.PopOldest(10)
+		if len(remaining) != 1 || string(remaining[0]) != `{"id":3}` {
+			t.Fatalf("remaining queue = %q, want third item only", remaining)
+		}
 	})
-
-	h := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
-	h.SetUsageStatistics(stats)
-
-	rec := httptest.NewRecorder()
-	ctx, _ := gin.CreateTestContext(rec)
-	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage", nil)
-
-	h.GetUsageStatistics(ctx)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-
-	var payload struct {
-		Usage          internalusage.StatisticsSnapshot `json:"usage"`
-		FailedRequests int64                            `json:"failed_requests"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-
-	details := payload.Usage.APIs["test-key"].Models["gpt-5.4"].Details
-	if len(details) != 1 {
-		t.Fatalf("details len = %d, want 1", len(details))
-	}
-	if details[0].ClientIP != "198.51.100.7" {
-		t.Fatalf("client_ip = %q, want %q", details[0].ClientIP, "198.51.100.7")
-	}
-	if payload.FailedRequests != 0 {
-		t.Fatalf("failed_requests = %d, want 0", payload.FailedRequests)
-	}
 }
 
-func TestExportImportUsageStatistics_PreservesClientIP(t *testing.T) {
-	t.Setenv("MANAGEMENT_PASSWORD", "")
+func TestGetUsageQueueInvalidCountDoesNotPop(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	withManagementUsageQueue(t, func() {
+		redisqueue.Enqueue([]byte(`{"id":1}`))
 
-	sourceStats := internalusage.NewRequestStatistics()
-	recordManagementUsageWithRemoteAddr(t, sourceStats, "[2001:db8::1]:443", coreusage.Record{
-		APIKey:      "test-key",
-		Model:       "gpt-5.4",
-		RequestedAt: time.Date(2026, 3, 27, 9, 0, 0, 0, time.UTC),
-		Detail: coreusage.Detail{
-			InputTokens:  5,
-			OutputTokens: 8,
-			TotalTokens:  13,
-		},
+		rec := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(rec)
+		ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=0", nil)
+
+		h := &Handler{}
+		h.GetUsageQueue(ginCtx)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+		}
+
+		remaining := redisqueue.PopOldest(10)
+		if len(remaining) != 1 || string(remaining[0]) != `{"id":1}` {
+			t.Fatalf("remaining queue = %q, want original item", remaining)
+		}
 	})
-
-	exportHandler := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
-	exportHandler.SetUsageStatistics(sourceStats)
-
-	exportRec := httptest.NewRecorder()
-	exportCtx, _ := gin.CreateTestContext(exportRec)
-	exportCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage/export", nil)
-	exportHandler.ExportUsageStatistics(exportCtx)
-
-	if exportRec.Code != http.StatusOK {
-		t.Fatalf("export status = %d, want %d, body=%s", exportRec.Code, http.StatusOK, exportRec.Body.String())
-	}
-
-	targetStats := internalusage.NewRequestStatistics()
-	importHandler := NewHandlerWithoutConfigFilePath(&config.Config{}, nil)
-	importHandler.SetUsageStatistics(targetStats)
-
-	importRec := httptest.NewRecorder()
-	importCtx, _ := gin.CreateTestContext(importRec)
-	importReq := httptest.NewRequest(http.MethodPost, "/v0/management/usage/import", bytes.NewReader(exportRec.Body.Bytes()))
-	importReq.Header.Set("Content-Type", "application/json")
-	importCtx.Request = importReq
-	importHandler.ImportUsageStatistics(importCtx)
-
-	if importRec.Code != http.StatusOK {
-		t.Fatalf("import status = %d, want %d, body=%s", importRec.Code, http.StatusOK, importRec.Body.String())
-	}
-
-	snapshot := targetStats.Snapshot()
-	details := snapshot.APIs["test-key"].Models["gpt-5.4"].Details
-	if len(details) != 1 {
-		t.Fatalf("details len = %d, want 1", len(details))
-	}
-	if details[0].ClientIP != "2001:db8::1" {
-		t.Fatalf("client_ip = %q, want %q", details[0].ClientIP, "2001:db8::1")
-	}
 }
 
-func recordManagementUsageWithRemoteAddr(t *testing.T, stats *internalusage.RequestStatistics, remoteAddr string, record coreusage.Record) {
+func withManagementUsageQueue(t *testing.T, fn func()) {
 	t.Helper()
 
-	recorder := httptest.NewRecorder()
-	ginCtx, _ := gin.CreateTestContext(recorder)
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	req.RemoteAddr = remoteAddr
-	ginCtx.Request = req
+	prevQueueEnabled := redisqueue.Enabled()
+	redisqueue.SetEnabled(false)
+	redisqueue.SetEnabled(true)
 
-	ctx := context.WithValue(context.Background(), "gin", ginCtx)
-	stats.Record(ctx, record)
+	defer func() {
+		redisqueue.SetEnabled(false)
+		redisqueue.SetEnabled(prevQueueEnabled)
+	}()
+
+	fn()
+}
+
+func requireRecordID(t *testing.T, raw json.RawMessage, want int) {
+	t.Helper()
+
+	var payload struct {
+		ID int `json:"id"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal record: %v", errUnmarshal)
+	}
+	if payload.ID != want {
+		t.Fatalf("record id = %d, want %d", payload.ID, want)
+	}
 }

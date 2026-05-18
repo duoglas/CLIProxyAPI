@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -311,33 +311,39 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						if errRename != nil {
 							log.Warnf("Failed to rename parameters for tool '%s': %v", fn.Get("name").String(), errRename)
 							var errSet error
-							fnRaw, errSet = sjson.Set(fnRaw, "parametersJsonSchema.type", "object")
+							fnRawBytes := []byte(fnRaw)
+							fnRawBytes, errSet = sjson.SetBytes(fnRawBytes, "parametersJsonSchema.type", "object")
 							if errSet != nil {
 								log.Warnf("Failed to set default schema type for tool '%s': %v", fn.Get("name").String(), errSet)
 								continue
 							}
-							fnRaw, errSet = sjson.SetRaw(fnRaw, "parametersJsonSchema.properties", `{}`)
+							fnRawBytes, errSet = sjson.SetRawBytes(fnRawBytes, "parametersJsonSchema.properties", []byte(`{}`))
 							if errSet != nil {
 								log.Warnf("Failed to set default schema properties for tool '%s': %v", fn.Get("name").String(), errSet)
 								continue
 							}
+							fnRaw = string(fnRawBytes)
 						} else {
 							fnRaw = renamed
 						}
 					} else {
 						var errSet error
-						fnRaw, errSet = sjson.Set(fnRaw, "parametersJsonSchema.type", "object")
+						fnRawBytes := []byte(fnRaw)
+						fnRawBytes, errSet = sjson.SetBytes(fnRawBytes, "parametersJsonSchema.type", "object")
 						if errSet != nil {
 							log.Warnf("Failed to set default schema type for tool '%s': %v", fn.Get("name").String(), errSet)
 							continue
 						}
-						fnRaw, errSet = sjson.SetRaw(fnRaw, "parametersJsonSchema.properties", `{}`)
+						fnRawBytes, errSet = sjson.SetRawBytes(fnRawBytes, "parametersJsonSchema.properties", []byte(`{}`))
 						if errSet != nil {
 							log.Warnf("Failed to set default schema properties for tool '%s': %v", fn.Get("name").String(), errSet)
 							continue
 						}
+						fnRaw = string(fnRawBytes)
 					}
-					fnRaw, _ = sjson.Set(fnRaw, "name", util.SanitizeFunctionName(fn.Get("name").String()))
+					fnRawBytes := []byte(fnRaw)
+					fnRawBytes, _ = sjson.SetBytes(fnRawBytes, "name", util.SanitizeFunctionName(fn.Get("name").String()))
+					fnRaw = string(fnRawBytes)
 					fnRaw, _ = sjson.Delete(fnRaw, "strict")
 					if !hasFunction {
 						functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", []byte("[]"))

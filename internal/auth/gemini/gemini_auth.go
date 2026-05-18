@@ -13,12 +13,12 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/browser"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/browser"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 
@@ -329,10 +329,7 @@ waitForCallback:
 				return nil, err
 			default:
 			}
-			manualInputCh, manualInputErrCh = misc.AsyncPrompt(
-				opts.Prompt,
-				"Paste the Gemini callback URL (or press Enter to keep waiting): ",
-			)
+			manualInputCh, manualInputErrCh = misc.AsyncPrompt(opts.Prompt, "Paste the Gemini callback URL (or press Enter to keep waiting): ")
 			continue
 		case input := <-manualInputCh:
 			manualInputCh = nil

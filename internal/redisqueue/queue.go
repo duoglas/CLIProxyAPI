@@ -6,11 +6,12 @@ import (
 	"time"
 )
 
-const retentionWindow = time.Minute
-
 const (
-	maxQueueItems = 10000
-	maxQueueBytes = 16 << 20
+	defaultRetentionSeconds int64 = 60
+	maxRetentionSeconds     int64 = 3600
+	usageSubscriberBuffer         = 256
+	maxQueueItems                 = 10000
+	maxQueueBytes                 = 16 << 20
 )
 
 type queueItem struct {
@@ -19,19 +20,24 @@ type queueItem struct {
 }
 
 type queue struct {
-	mu         sync.Mutex
-	items      []queueItem
-	head       int
-	totalBytes int
+	mu               sync.Mutex
+	items            []queueItem
+	head             int
+	totalBytes       int
+	subscribers      map[uint64]chan []byte
+	nextSubscriberID uint64
 }
 
 var (
-	enabled atomic.Bool
-	global  queue
+	enabled          atomic.Bool
+	retentionSeconds atomic.Int64
+	global           queue
 )
 
-// SetEnabled toggles the Redis-compatible usage queue. Disabling the queue
-// clears any buffered usage details so stale data is not exposed later.
+func init() {
+	retentionSeconds.Store(defaultRetentionSeconds)
+}
+
 func SetEnabled(value bool) {
 	enabled.Store(value)
 	if !value {
@@ -39,71 +45,170 @@ func SetEnabled(value bool) {
 	}
 }
 
-// Enabled reports whether usage details should be queued for RESP consumers.
-func Enabled() bool { return enabled.Load() }
+func Enabled() bool {
+	return enabled.Load()
+}
 
-// Enqueue appends a usage detail payload when queueing is enabled.
+func SetRetentionSeconds(value int) {
+	normalized := int64(value)
+	if normalized <= 0 {
+		normalized = defaultRetentionSeconds
+	} else if normalized > maxRetentionSeconds {
+		normalized = maxRetentionSeconds
+	}
+	retentionSeconds.Store(normalized)
+}
+
 func Enqueue(payload []byte) {
-	if !enabled.Load() || len(payload) == 0 {
+	if !Enabled() {
+		return
+	}
+	if len(payload) == 0 {
+		return
+	}
+	if global.publishToSubscribers(payload) {
 		return
 	}
 	global.enqueue(payload)
 }
 
-// PopOldest removes and returns up to count oldest non-expired payloads.
 func PopOldest(count int) [][]byte {
-	if !enabled.Load() || count <= 0 {
+	if !Enabled() {
+		return nil
+	}
+	if count <= 0 {
 		return nil
 	}
 	return global.popOldest(count)
 }
 
-// PopNewest removes and returns up to count newest non-expired payloads.
 func PopNewest(count int) [][]byte {
-	if !enabled.Load() || count <= 0 {
+	if !Enabled() {
+		return nil
+	}
+	if count <= 0 {
 		return nil
 	}
 	return global.popNewest(count)
 }
 
+func SubscribeUsage() (<-chan []byte, func()) {
+	return global.subscribeUsage()
+}
+
 func (q *queue) clear() {
 	q.mu.Lock()
-	defer q.mu.Unlock()
+
+	subscribers := make([]chan []byte, 0, len(q.subscribers))
+	for _, subscriber := range q.subscribers {
+		subscribers = append(subscribers, subscriber)
+	}
 	q.items = nil
 	q.head = 0
 	q.totalBytes = 0
+	q.subscribers = nil
+	q.mu.Unlock()
+
+	for _, subscriber := range subscribers {
+		close(subscriber)
+	}
 }
 
 func (q *queue) enqueue(payload []byte) {
+	now := time.Now()
+
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.pruneLocked(time.Now())
-	copyPayload := append([]byte(nil), payload...)
-	q.items = append(q.items, queueItem{enqueuedAt: time.Now(), payload: copyPayload})
-	q.totalBytes += len(copyPayload)
+	q.pruneLocked(now)
+	cloned := append([]byte(nil), payload...)
+	q.items = append(q.items, queueItem{
+		enqueuedAt: now,
+		payload:    cloned,
+	})
+	q.totalBytes += len(cloned)
 	q.enforceCapacityLocked()
 	q.maybeCompactLocked()
 }
 
-func (q *queue) popOldest(count int) [][]byte {
+func (q *queue) publishToSubscribers(payload []byte) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.pruneLocked(time.Now())
-	if count <= 0 || q.head >= len(q.items) {
-		return nil
+	if len(q.subscribers) == 0 {
+		return false
 	}
 
+	for id, subscriber := range q.subscribers {
+		cloned := append([]byte(nil), payload...)
+		select {
+		case subscriber <- cloned:
+		default:
+			delete(q.subscribers, id)
+			close(subscriber)
+		}
+	}
+
+	return true
+}
+
+func (q *queue) subscribeUsage() (<-chan []byte, func()) {
+	subscriber := make(chan []byte, usageSubscriberBuffer)
+
+	q.mu.Lock()
+	if q.subscribers == nil {
+		q.subscribers = make(map[uint64]chan []byte)
+	}
+	q.nextSubscriberID++
+	id := q.nextSubscriberID
+	q.subscribers[id] = subscriber
+	q.mu.Unlock()
+
+	var once sync.Once
+	unsubscribe := func() {
+		once.Do(func() {
+			q.unsubscribeUsage(id)
+		})
+	}
+	return subscriber, unsubscribe
+}
+
+func (q *queue) unsubscribeUsage(id uint64) {
+	q.mu.Lock()
+	subscriber, ok := q.subscribers[id]
+	if ok {
+		delete(q.subscribers, id)
+	}
+	q.mu.Unlock()
+
+	if ok {
+		close(subscriber)
+	}
+}
+
+func (q *queue) popOldest(count int) [][]byte {
+	now := time.Now()
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.pruneLocked(now)
 	available := len(q.items) - q.head
+	if available <= 0 {
+		q.items = nil
+		q.head = 0
+		q.totalBytes = 0
+		return nil
+	}
 	if count > available {
 		count = available
 	}
+
 	out := make([][]byte, 0, count)
 	for i := 0; i < count; i++ {
-		payload := q.items[q.head+i].payload
-		out = append(out, append([]byte(nil), payload...))
-		q.totalBytes -= len(payload)
+		item := q.items[q.head+i]
+		q.totalBytes -= len(item.payload)
+		out = append(out, append([]byte(nil), item.payload...))
 	}
 	q.head += count
 	q.maybeCompactLocked()
@@ -111,42 +216,60 @@ func (q *queue) popOldest(count int) [][]byte {
 }
 
 func (q *queue) popNewest(count int) [][]byte {
+	now := time.Now()
+
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.pruneLocked(time.Now())
-	if count <= 0 || q.head >= len(q.items) {
+	q.pruneLocked(now)
+	available := len(q.items) - q.head
+	if available <= 0 {
+		q.items = nil
+		q.head = 0
+		q.totalBytes = 0
 		return nil
 	}
-
-	available := len(q.items) - q.head
 	if count > available {
 		count = available
 	}
+
 	out := make([][]byte, 0, count)
 	for i := 0; i < count; i++ {
 		idx := len(q.items) - 1 - i
-		payload := q.items[idx].payload
-		out = append(out, append([]byte(nil), payload...))
-		q.totalBytes -= len(payload)
+		item := q.items[idx]
+		q.totalBytes -= len(item.payload)
+		out = append(out, append([]byte(nil), item.payload...))
+		q.items[idx] = queueItem{}
 	}
 	q.items = q.items[:len(q.items)-count]
 	q.maybeCompactLocked()
 	return out
 }
 
-func (q *queue) pruneLocked(now time.Time) {
-	cutoff := now.Add(-retentionWindow)
-	for q.head < len(q.items) && q.items[q.head].enqueuedAt.Before(cutoff) {
-		q.totalBytes -= len(q.items[q.head].payload)
-		q.head++
-	}
-	q.maybeCompactLocked()
-}
-
 func (q *queue) enforceCapacityLocked() {
 	for q.head < len(q.items) && (len(q.items)-q.head > maxQueueItems || q.totalBytes > maxQueueBytes) {
 		q.totalBytes -= len(q.items[q.head].payload)
+		q.items[q.head] = queueItem{}
+		q.head++
+	}
+}
+
+func (q *queue) pruneLocked(now time.Time) {
+	if q.head >= len(q.items) {
+		q.items = nil
+		q.head = 0
+		q.totalBytes = 0
+		return
+	}
+
+	windowSeconds := retentionSeconds.Load()
+	if windowSeconds <= 0 {
+		windowSeconds = defaultRetentionSeconds
+	}
+	cutoff := now.Add(-time.Duration(windowSeconds) * time.Second)
+	for q.head < len(q.items) && q.items[q.head].enqueuedAt.Before(cutoff) {
+		q.totalBytes -= len(q.items[q.head].payload)
+		q.items[q.head] = queueItem{}
 		q.head++
 	}
 }
@@ -158,12 +281,12 @@ func (q *queue) maybeCompactLocked() {
 	if q.head >= len(q.items) {
 		q.items = nil
 		q.head = 0
+		q.totalBytes = 0
 		return
 	}
-	if q.head < 64 && q.head*2 < len(q.items) {
+	if q.head < 1024 && q.head*2 < len(q.items) {
 		return
 	}
-	remaining := append([]queueItem(nil), q.items[q.head:]...)
-	q.items = remaining
+	q.items = append([]queueItem(nil), q.items[q.head:]...)
 	q.head = 0
 }

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -143,8 +143,8 @@ func TestRedisQueueProtocolRejectsOversizedBulkAndPopCount(t *testing.T) {
 	if _, err := readRESPLine(reader); err == nil {
 		t.Fatal("readRESPLine oversized error = nil, want error")
 	}
-	if _, _, err := parsePopCount([]string{"LPOP", "usage", fmt.Sprint(respMaxPopCount + 1)}); err == nil {
-		t.Fatal("parsePopCount oversized error = nil, want error")
+	if count, hasCount, ok := parsePopCount([]string{"LPOP", "usage", fmt.Sprint(respMaxPopCount + 1)}); !hasCount || !ok || count != 0 {
+		t.Fatalf("parsePopCount oversized = count %d hasCount %v ok %v, want rejected zero count", count, hasCount, ok)
 	}
 }
 

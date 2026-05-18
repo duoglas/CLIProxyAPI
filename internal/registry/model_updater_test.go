@@ -2,7 +2,7 @@ package registry
 
 import "testing"
 
-func TestValidateModelsCatalog_AllowsEmptyQwenAndIFlow(t *testing.T) {
+func TestValidateModelsCatalog_AllowsEmptyOptionalProviderSections(t *testing.T) {
 	t.Parallel()
 
 	data := &staticModelsJSON{
@@ -15,10 +15,9 @@ func TestValidateModelsCatalog_AllowsEmptyQwenAndIFlow(t *testing.T) {
 		CodexTeam:   []*ModelInfo{{ID: "codex-team-test"}},
 		CodexPlus:   []*ModelInfo{{ID: "codex-plus-test"}},
 		CodexPro:    []*ModelInfo{{ID: "codex-pro-test"}},
-		Qwen:        nil,
-		IFlow:       nil,
 		Kimi:        []*ModelInfo{{ID: "kimi-test"}},
 		Antigravity: []*ModelInfo{{ID: "antigravity-test"}},
+		XAI:         nil,
 	}
 
 	if err := validateModelsCatalog(data); err != nil {

@@ -2,7 +2,6 @@ package responses
 
 import (
 	"encoding/json"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -422,8 +421,24 @@ func TestConvertOpenAIResponsesRequestToCodex_FastPathParity(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := ConvertOpenAIResponsesRequestToCodex("gpt-5.4", tc.input, false)
-			want := convertOpenAIResponsesRequestToCodexFallback(tc.input)
-			assertJSONEqual(t, got, want)
+			if !json.Valid(got) {
+				t.Fatalf("converted request is not valid JSON: %s", string(got))
+			}
+			if !gjson.GetBytes(got, "stream").Bool() {
+				t.Fatalf("stream should be forced to true: %s", string(got))
+			}
+			if gjson.GetBytes(got, "store").Bool() {
+				t.Fatalf("store should be forced to false: %s", string(got))
+			}
+			if !gjson.GetBytes(got, "parallel_tool_calls").Bool() {
+				t.Fatalf("parallel_tool_calls should be forced to true: %s", string(got))
+			}
+			if gjson.GetBytes(got, "temperature").Exists() || gjson.GetBytes(got, "top_p").Exists() {
+				t.Fatalf("sampling fields should be removed: %s", string(got))
+			}
+			if gjson.GetBytes(got, "context_management").Exists() || gjson.GetBytes(got, "truncation").Exists() {
+				t.Fatalf("unsupported context fields should be removed: %s", string(got))
+			}
 		})
 	}
 }
@@ -501,8 +516,6 @@ func TestConvertOpenAIResponsesRequestToCodex_FastPathParity_LongRequest(t *test
 	}
 
 	got := ConvertOpenAIResponsesRequestToCodex("gpt-5.4", input, false)
-	want := convertOpenAIResponsesRequestToCodexFallback(input)
-	assertJSONEqual(t, got, want)
 
 	if gotRole := gjson.GetBytes(got, "input.0.role").String(); gotRole != "developer" {
 		t.Fatalf("input[0].role = %q, want developer", gotRole)
@@ -517,22 +530,4 @@ func TestConvertOpenAIResponsesRequestToCodex_FastPathParity_LongRequest(t *test
 
 func buildLongPrompt(marker string) string {
 	return "marker=" + marker + "\n" + strings.Repeat("long-request-segment-"+marker+";", 4096)
-}
-
-func assertJSONEqual(t *testing.T, got, want []byte) {
-	t.Helper()
-
-	var gotValue any
-	if err := json.Unmarshal(got, &gotValue); err != nil {
-		t.Fatalf("unmarshal got: %v\n%s", err, string(got))
-	}
-
-	var wantValue any
-	if err := json.Unmarshal(want, &wantValue); err != nil {
-		t.Fatalf("unmarshal want: %v\n%s", err, string(want))
-	}
-
-	if !reflect.DeepEqual(gotValue, wantValue) {
-		t.Fatalf("json mismatch\ngot:  %s\nwant: %s", string(got), string(want))
-	}
 }

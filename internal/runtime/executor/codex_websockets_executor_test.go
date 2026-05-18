@@ -1,21 +1,22 @@
 package executor
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -38,6 +39,118 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 }
 
+func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	capturedPayload := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("request path = %s, want /responses", r.URL.Path)
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("upgrade websocket: %v", err)
+		}
+		defer func() { _ = conn.Close() }()
+
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read upstream websocket message: %v", err)
+		}
+		if msgType != websocket.TextMessage {
+			t.Fatalf("message type = %d, want text", msgType)
+		}
+		capturedPayload <- bytes.Clone(payload)
+
+		completed := []byte(`{"type":"response.completed","response":{"id":"resp-2","output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+		if errWrite := conn.WriteMessage(websocket.TextMessage, completed); errWrite != nil {
+			t.Fatalf("write completed websocket message: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{SDKConfig: config.SDKConfig{DisableImageGeneration: config.DisableImageGenerationAll}})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "sk-test", "base_url": server.URL}}
+	req := cliproxyexecutor.Request{
+		Model:   "gpt-5-codex",
+		Payload: []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
+
+	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	select {
+	case payload := <-capturedPayload:
+		if got := gjson.GetBytes(payload, "type").String(); got != "response.create" {
+			t.Fatalf("upstream type = %s, want response.create; payload=%s", got, payload)
+		}
+		if got := gjson.GetBytes(payload, "previous_response_id").String(); got != "resp-1" {
+			t.Fatalf("upstream previous_response_id = %s, want resp-1; payload=%s", got, payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for upstream websocket payload")
+	}
+}
+
+func TestCodexWebsocketsUpstreamDisconnectChanSignalsOnInvalidate(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			if _, _, errRead := conn.ReadMessage(); errRead != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	exec := NewCodexWebsocketsExecutor(&config.Config{})
+	sessionID := "sess-1"
+	disconnectCh := exec.UpstreamDisconnectChan(sessionID)
+	if disconnectCh == nil {
+		t.Fatal("expected disconnect channel")
+	}
+
+	sess := exec.getOrCreateSession(sessionID)
+	if sess == nil {
+		t.Fatal("expected session")
+	}
+	sess.connMu.Lock()
+	sess.conn = conn
+	sess.authID = "auth-1"
+	sess.wsURL = "ws://example.test/responses"
+	sess.readerConn = conn
+	sess.connMu.Unlock()
+
+	upstreamErr := errors.New("upstream gone")
+	exec.invalidateUpstreamConn(sess, conn, "test_invalidate", upstreamErr)
+
+	select {
+	case errRead, ok := <-disconnectCh:
+		if !ok {
+			t.Fatal("expected disconnect channel to deliver error before closing")
+		}
+		if errRead == nil || errRead.Error() != upstreamErr.Error() {
+			t.Fatalf("disconnect error = %v, want %v", errRead, upstreamErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for disconnect signal")
+	}
+}
+
 func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) {
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, nil, "", nil)
 
@@ -46,6 +159,18 @@ func TestApplyCodexWebsocketHeadersDefaultsToCurrentResponsesBeta(t *testing.T) 
 	}
 	if got := headers.Get("User-Agent"); got != codexUserAgent {
 		t.Fatalf("User-Agent = %s, want %s", got, codexUserAgent)
+	}
+	if !strings.HasPrefix(codexUserAgent, codexOriginator+"/") {
+		t.Fatalf("default Codex User-Agent = %s, want prefix %s/", codexUserAgent, codexOriginator)
+	}
+	if strings.HasPrefix(codexUserAgent, "codex-tui/") {
+		t.Fatalf("default Codex User-Agent = %s, must not use stale codex-tui prefix", codexUserAgent)
+	}
+	if strings.Contains(codexUserAgent, "(codex-tui;") {
+		t.Fatalf("default Codex User-Agent = %s, must not include stale codex-tui suffix", codexUserAgent)
+	}
+	if got := headers.Get("Originator"); got != codexOriginator {
+		t.Fatalf("Originator = %s, want %s", got, codexOriginator)
 	}
 	if got := headers.Get("Version"); got != "" {
 		t.Fatalf("Version = %q, want empty", got)
@@ -68,15 +193,20 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 	}
 	ctx := contextWithGinHeaders(map[string]string{
 		"Originator":            "Codex Desktop",
+		"User-Agent":            "codex_cli_rs/0.1.0",
 		"Version":               "0.115.0-alpha.27",
 		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
 		"X-Client-Request-Id":   "019d2233-e240-7162-992d-38df0a2a0e0d",
+		"session_id":            "sess-client",
 	})
 
 	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "", nil)
 
 	if got := headers.Get("Originator"); got != "Codex Desktop" {
 		t.Fatalf("Originator = %s, want %s", got, "Codex Desktop")
+	}
+	if got := headers.Get("User-Agent"); got != "codex_cli_rs/0.1.0" {
+		t.Fatalf("User-Agent = %s, want %s", got, "codex_cli_rs/0.1.0")
 	}
 	if got := headers.Get("Version"); got != "0.115.0-alpha.27" {
 		t.Fatalf("Version = %s, want %s", got, "0.115.0-alpha.27")
@@ -86,6 +216,12 @@ func TestApplyCodexWebsocketHeadersPassesThroughClientIdentityHeaders(t *testing
 	}
 	if got := headers.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
+	}
+	if got := headerValueCaseInsensitive(headers, "session_id"); got != "sess-client" {
+		t.Fatalf("session_id = %s, want sess-client", got)
+	}
+	if _, ok := headers["session_id"]; !ok {
+		t.Fatalf("expected lowercase session_id header key, got %#v", headers)
 	}
 }
 
@@ -183,11 +319,136 @@ func TestApplyCodexWebsocketHeadersIgnoresConfigForAPIKeyAuth(t *testing.T) {
 
 	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "sk-test", cfg)
 
-	if got := headers.Get("User-Agent"); got != codexUserAgent {
-		t.Fatalf("User-Agent = %s, want %s", got, codexUserAgent)
+	if got := headers.Get("User-Agent"); got != "" {
+		t.Fatalf("User-Agent = %s, want empty", got)
 	}
 	if got := headers.Get("x-codex-beta-features"); got != "" {
 		t.Fatalf("x-codex-beta-features = %q, want empty", got)
+	}
+	if got := headers.Get("Originator"); got != "" {
+		t.Fatalf("Originator = %s, want empty", got)
+	}
+}
+
+func TestApplyCodexWebsocketHeadersPreservesExplicitAPIKeyUserAgent(t *testing.T) {
+	auth := &cliproxyauth.Auth{Provider: "codex", Attributes: map[string]string{"api_key": "sk-test"}}
+	ctx := contextWithGinHeaders(map[string]string{"User-Agent": "api-key-client/1.0", "Originator": "explicit-origin"})
+
+	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, auth, "sk-test", nil)
+
+	if got := headers.Get("User-Agent"); got != "api-key-client/1.0" {
+		t.Fatalf("User-Agent = %s, want api-key-client/1.0", got)
+	}
+	if got := headers.Get("Originator"); got != "explicit-origin" {
+		t.Fatalf("Originator = %s, want explicit-origin", got)
+	}
+}
+
+func TestApplyCodexPromptCacheHeadersSetsLowercaseSessionAndLegacyConversation(t *testing.T) {
+	req := cliproxyexecutor.Request{Model: "gpt-5-codex", Payload: []byte(`{"prompt_cache_key":"cache-1"}`)}
+
+	_, headers := applyCodexPromptCacheHeaders("openai-response", req, []byte(`{"model":"gpt-5-codex"}`))
+
+	if got := headerValueCaseInsensitive(headers, "session_id"); got != "cache-1" {
+		t.Fatalf("session_id = %s, want cache-1", got)
+	}
+	if _, ok := headers["session_id"]; !ok {
+		t.Fatalf("expected lowercase session_id key, got %#v", headers)
+	}
+	if got := headers.Get("Conversation_id"); got != "cache-1" {
+		t.Fatalf("Conversation_id = %s, want cache-1", got)
+	}
+}
+
+func TestApplyCodexWebsocketHeadersUsesCanonicalAccountHeader(t *testing.T) {
+	auth := &cliproxyauth.Auth{Provider: "codex", Metadata: map[string]any{"account_id": "acct-1"}}
+
+	headers := applyCodexWebsocketHeaders(context.Background(), http.Header{}, auth, "", nil)
+
+	if got := headerValueCaseInsensitive(headers, "ChatGPT-Account-ID"); got != "acct-1" {
+		t.Fatalf("ChatGPT-Account-ID = %s, want acct-1", got)
+	}
+	values, ok := headers["ChatGPT-Account-ID"]
+	if !ok {
+		t.Fatalf("expected exact ChatGPT-Account-ID key, got %#v", headers)
+	}
+	if len(values) != 1 || values[0] != "acct-1" {
+		t.Fatalf("ChatGPT-Account-ID values = %#v, want [acct-1]", values)
+	}
+}
+
+func TestBuildCodexResponsesWebsocketURLRequiresHTTPURL(t *testing.T) {
+	if got, err := buildCodexResponsesWebsocketURL("https://example.com/backend/responses"); err != nil || got != "wss://example.com/backend/responses" {
+		t.Fatalf("https URL = %q, %v; want wss URL", got, err)
+	}
+	if _, err := buildCodexResponsesWebsocketURL("ftp://example.com/responses"); err == nil {
+		t.Fatalf("expected unsupported scheme error")
+	}
+	if _, err := buildCodexResponsesWebsocketURL("https:///responses"); err == nil {
+		t.Fatalf("expected empty host error")
+	}
+}
+
+func TestParseCodexWebsocketErrorMarksConnectionLimitRetryable(t *testing.T) {
+	err, ok := parseCodexWebsocketError([]byte(`{"type":"error","status":429,"error":{"code":"websocket_connection_limit_reached","message":"too many websockets"},"headers":{"retry-after":"1"}}`))
+	if !ok {
+		t.Fatalf("expected websocket error")
+	}
+	status, ok := err.(interface{ StatusCode() int })
+	if !ok || status.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("status = %#v, want 429", err)
+	}
+	retryable, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok || retryable.RetryAfter() == nil {
+		t.Fatalf("expected retryable websocket connection limit error")
+	}
+	if got := *retryable.RetryAfter(); got != 0 {
+		t.Fatalf("retryAfter = %v, want connection-limit fallback 0", got)
+	}
+	withHeaders, ok := err.(interface{ Headers() http.Header })
+	if !ok || withHeaders.Headers().Get("retry-after") != "1" {
+		t.Fatalf("headers = %#v, want retry-after", err)
+	}
+}
+
+func TestParseCodexWebsocketErrorUsesUsageLimitRetryMetadata(t *testing.T) {
+	err, ok := parseCodexWebsocketError([]byte(`{"type":"error","status":429,"body":{"error":{"type":"usage_limit_reached","message":"usage limit reached","resets_in_seconds":7}}}`))
+	if !ok {
+		t.Fatalf("expected websocket error")
+	}
+
+	retryable, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok || retryable.RetryAfter() == nil {
+		t.Fatalf("expected retryable usage limit websocket error")
+	}
+	if got := *retryable.RetryAfter(); got != 7*time.Second {
+		t.Fatalf("retryAfter = %v, want 7s", got)
+	}
+}
+
+func TestParseCodexWebsocketErrorPreservesWrappedBodyAndHeaders(t *testing.T) {
+	err, ok := parseCodexWebsocketError([]byte(`{"type":"error","status":429,"body":{"error":{"code":"websocket_connection_limit_reached","type":"server_error","message":"too many websocket connections"}},"headers":{"x-request-id":"req-1"}}`))
+	if !ok {
+		t.Fatalf("expected websocket error")
+	}
+
+	parsed := gjson.Parse(err.Error())
+	if got := parsed.Get("status").Int(); got != http.StatusTooManyRequests {
+		t.Fatalf("wrapped status = %d, want 429; payload=%s", got, err.Error())
+	}
+	if got := parsed.Get("body.error.code").String(); got != "websocket_connection_limit_reached" {
+		t.Fatalf("wrapped body error code = %s, want websocket_connection_limit_reached; payload=%s", got, err.Error())
+	}
+	if got := parsed.Get("error.code").String(); got != "websocket_connection_limit_reached" {
+		t.Fatalf("surface error code = %s, want websocket_connection_limit_reached; payload=%s", got, err.Error())
+	}
+	retryable, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok || retryable.RetryAfter() == nil {
+		t.Fatalf("expected body.error.code websocket connection limit to be retryable")
+	}
+	withHeaders, ok := err.(interface{ Headers() http.Header })
+	if !ok || withHeaders.Headers().Get("x-request-id") != "req-1" {
+		t.Fatalf("headers = %#v, want x-request-id", err)
 	}
 }
 
@@ -220,135 +481,6 @@ func TestApplyCodexHeadersUsesConfigUserAgentForOAuth(t *testing.T) {
 	}
 }
 
-func TestApplyCodexHeadersSkipsGeneratedSessionIDForNonMacUserAgent(t *testing.T) {
-	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
-	if err != nil {
-		t.Fatalf("NewRequest() error = %v", err)
-	}
-	req = req.WithContext(contextWithGinHeaders(map[string]string{
-		"User-Agent": "codex-cli/0.1 (Linux; x64)",
-	}))
-
-	applyCodexHeaders(req, nil, "oauth-token", true, &config.Config{
-		CodexHeaderDefaults: config.CodexHeaderDefaults{
-			UserAgent: "codex-cli/0.1 (Linux; x64)",
-		},
-	})
-
-	if got := req.Header.Get("Session_id"); got != "" {
-		t.Fatalf("Session_id = %q, want empty for non-Mac user agent", got)
-	}
-}
-
-func TestApplyCodexWebsocketHeadersSkipsGeneratedSessionIDForNonMacUserAgent(t *testing.T) {
-	ctx := contextWithGinHeaders(map[string]string{
-		"User-Agent": "codex-cli/0.1 (Linux; x64)",
-	})
-	headers := applyCodexWebsocketHeaders(ctx, http.Header{}, nil, "", nil)
-
-	if got := headers.Get("Session_id"); got != "" {
-		t.Fatalf("Session_id = %q, want empty for non-Mac user agent", got)
-	}
-}
-
-func TestCodexAutoExecutorExecuteStream_WebsocketStripsPrefixedModelFromOutboundRequest(t *testing.T) {
-	t.Parallel()
-
-	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	reqPathCh := make(chan string, 1)
-	reqBodyCh := make(chan []byte, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Errorf("upgrade websocket: %v", err)
-			return
-		}
-		defer func() { _ = conn.Close() }()
-
-		msgType, payload, err := conn.ReadMessage()
-		if err != nil {
-			t.Errorf("read websocket request: %v", err)
-			return
-		}
-		if msgType != websocket.TextMessage {
-			t.Errorf("message type = %d, want %d", msgType, websocket.TextMessage)
-			return
-		}
-		reqPathCh <- r.URL.Path
-		reqBodyCh <- payload
-
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"resp_ws"}}`)); err != nil {
-			t.Errorf("write websocket created event: %v", err)
-			return
-		}
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(codexCompletedEventJSON("resp_ws", "gpt-5.4", "ok-ws"))); err != nil {
-			t.Errorf("write websocket completed event: %v", err)
-		}
-	}))
-	defer server.Close()
-
-	auth := newCodexTestAuth(server.URL, "ws-key")
-	auth.Prefix = "team"
-	auth.Attributes["websockets"] = "true"
-
-	executor := NewCodexAutoExecutor(&config.Config{})
-	ctx, cancel := context.WithTimeout(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), 5*time.Second)
-	defer cancel()
-
-	result, err := executor.ExecuteStream(
-		ctx,
-		auth,
-		cliproxyexecutor.Request{
-			Model: "gpt-5.4",
-			Payload: []byte(`{
-				"model":"team/gpt-5.4",
-				"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
-				"stream":true
-			}`),
-		},
-		cliproxyexecutor.Options{
-			Stream:       true,
-			SourceFormat: sdktranslator.FromString("openai-response"),
-			Metadata: map[string]any{
-				cliproxyexecutor.RequestedModelMetadataKey: "team/gpt-5.4",
-			},
-		},
-	)
-	if err != nil {
-		t.Fatalf("ExecuteStream() error = %v", err)
-	}
-
-	for chunk := range result.Chunks {
-		if chunk.Err != nil {
-			t.Fatalf("stream chunk error = %v", chunk.Err)
-		}
-	}
-
-	select {
-	case path := <-reqPathCh:
-		if path != "/responses" {
-			t.Fatalf("websocket path = %q, want %q", path, "/responses")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for websocket request path")
-	}
-
-	select {
-	case payload := <-reqBodyCh:
-		if got := gjson.GetBytes(payload, "type").String(); got != "response.create" {
-			t.Fatalf("websocket request type = %q, want %q", got, "response.create")
-		}
-		if got := gjson.GetBytes(payload, "model").String(); got != "gpt-5.4" {
-			t.Fatalf("websocket request model = %q, want %q", got, "gpt-5.4")
-		}
-		if got := gjson.GetBytes(payload, "model").String(); got == "team/gpt-5.4" {
-			t.Fatalf("websocket request leaked prefixed model: %s", payload)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for websocket request body")
-	}
-}
-
 func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
 	if err != nil {
@@ -378,22 +510,6 @@ func TestApplyCodexHeadersPassesThroughClientIdentityHeaders(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Client-Request-Id"); got != "019d2233-e240-7162-992d-38df0a2a0e0d" {
 		t.Fatalf("X-Client-Request-Id = %s, want %s", got, "019d2233-e240-7162-992d-38df0a2a0e0d")
-	}
-}
-
-func TestApplyCodexHeadersPassesThroughBetaFeaturesHeader(t *testing.T) {
-	req, err := http.NewRequest(http.MethodPost, "https://example.com/responses", nil)
-	if err != nil {
-		t.Fatalf("NewRequest() error = %v", err)
-	}
-	req = req.WithContext(contextWithGinHeaders(map[string]string{
-		"X-Codex-Beta-Features": "tool-streaming,v2",
-	}))
-
-	applyCodexHeaders(req, nil, "oauth-token", true, nil)
-
-	if got := req.Header.Get("X-Codex-Beta-Features"); got != "tool-streaming,v2" {
-		t.Fatalf("X-Codex-Beta-Features = %q, want %q", got, "tool-streaming,v2")
 	}
 }
 
@@ -438,250 +554,5 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 
 	if dialer.Proxy != nil {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
-	}
-}
-
-func TestReadCodexWebsocketMessageReturnsWhenReadChannelClosed(t *testing.T) {
-	t.Parallel()
-
-	sess := &codexWebsocketSession{}
-	conn := &websocket.Conn{}
-	readCh := make(chan codexWebsocketRead)
-	close(readCh)
-
-	_, _, err := readCodexWebsocketMessage(context.Background(), sess, conn, readCh)
-	if err == nil {
-		t.Fatal("expected error when session read channel is closed")
-	}
-	if !strings.Contains(err.Error(), "session read channel closed") {
-		t.Fatalf("error = %v, want contains session read channel closed", err)
-	}
-}
-
-func TestEnsureUpstreamConnReconnectsWhenAuthChanges(t *testing.T) {
-	var (
-		mu             sync.Mutex
-		authorizations []string
-	)
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		mu.Lock()
-		authorizations = append(authorizations, strings.TrimSpace(r.Header.Get("Authorization")))
-		mu.Unlock()
-
-		go func() {
-			defer func() {
-				_ = conn.Close()
-			}()
-			for {
-				if _, _, errRead := conn.ReadMessage(); errRead != nil {
-					return
-				}
-			}
-		}()
-	}))
-	defer server.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	executor := NewCodexWebsocketsExecutor(&config.Config{})
-	sess := executor.getOrCreateSession("test-session")
-	if sess == nil {
-		t.Fatal("expected session to be created")
-	}
-
-	auth1 := &cliproxyauth.Auth{ID: "auth-1"}
-	headers1 := http.Header{}
-	headers1.Set("Authorization", "Bearer token-1")
-	conn1, _, errDial1 := executor.ensureUpstreamConn(context.Background(), auth1, sess, auth1.ID, wsURL, headers1)
-	if errDial1 != nil {
-		t.Fatalf("first ensureUpstreamConn failed: %v", errDial1)
-	}
-	if conn1 == nil {
-		t.Fatal("first ensureUpstreamConn returned nil connection")
-	}
-
-	auth2 := &cliproxyauth.Auth{ID: "auth-2"}
-	headers2 := http.Header{}
-	headers2.Set("Authorization", "Bearer token-2")
-	conn2, _, errDial2 := executor.ensureUpstreamConn(context.Background(), auth2, sess, auth2.ID, wsURL, headers2)
-	if errDial2 != nil {
-		t.Fatalf("second ensureUpstreamConn failed: %v", errDial2)
-	}
-	if conn2 == nil {
-		t.Fatal("second ensureUpstreamConn returned nil connection")
-	}
-	if conn1 == conn2 {
-		t.Fatal("expected auth change to force upstream reconnect")
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		mu.Lock()
-		count := len(authorizations)
-		mu.Unlock()
-		if count >= 2 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	mu.Lock()
-	got := append([]string(nil), authorizations...)
-	mu.Unlock()
-	if len(got) < 2 {
-		t.Fatalf("handshake count = %d, want at least 2", len(got))
-	}
-	if got[0] != "Bearer token-1" {
-		t.Fatalf("first Authorization = %q, want %q", got[0], "Bearer token-1")
-	}
-	if got[1] != "Bearer token-2" {
-		t.Fatalf("second Authorization = %q, want %q", got[1], "Bearer token-2")
-	}
-
-	executor.closeExecutionSession(sess, "test_done")
-}
-
-func TestCloseExecutionSessionUnblocksActiveRead(t *testing.T) {
-	t.Parallel()
-
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	serverConnCh := make(chan *websocket.Conn, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		serverConnCh <- conn
-		_, _, _ = conn.ReadMessage()
-	}))
-	defer server.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	clientConn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
-	if errDial != nil {
-		t.Fatalf("dial websocket: %v", errDial)
-	}
-	defer func() { _ = clientConn.Close() }()
-
-	var serverConn *websocket.Conn
-	select {
-	case serverConn = <-serverConnCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for server websocket connection")
-	}
-
-	sess := &codexWebsocketSession{
-		sessionID:  "session-close",
-		conn:       serverConn,
-		readerConn: serverConn,
-	}
-	readCh := make(chan codexWebsocketRead, 4)
-	sess.setActive(readCh)
-
-	executor := &CodexWebsocketsExecutor{
-		CodexExecutor: &CodexExecutor{},
-		sessions: map[string]*codexWebsocketSession{
-			"session-close": sess,
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	readErrCh := make(chan error, 1)
-	go func() {
-		_, _, err := readCodexWebsocketMessage(ctx, sess, serverConn, readCh)
-		readErrCh <- err
-	}()
-
-	executor.CloseExecutionSession("session-close")
-
-	select {
-	case err := <-readErrCh:
-		if err == nil {
-			t.Fatal("expected read error after closing execution session")
-		}
-		errText := err.Error()
-		if !strings.Contains(errText, "execution session closed") && !strings.Contains(errText, "session read channel closed") {
-			t.Fatalf("error = %v, want fast-fail error from session close path", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("read did not fail fast after closeExecutionSession")
-	}
-}
-
-func TestEnsureUpstreamConnAuthSwitchRebuildsWebsocketConn(t *testing.T) {
-	t.Parallel()
-
-	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	authHeaderCh := make(chan string, 4)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer func() { _ = conn.Close() }()
-
-		authHeaderCh <- strings.TrimSpace(r.Header.Get("Authorization"))
-		for {
-			_, _, errRead := conn.ReadMessage()
-			if errRead != nil {
-				return
-			}
-		}
-	}))
-	defer server.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	executor := NewCodexWebsocketsExecutor(&config.Config{})
-	sess := &codexWebsocketSession{sessionID: "session-auth-switch"}
-
-	headers1 := http.Header{}
-	headers1.Set("Authorization", "Bearer token-1")
-	conn1, _, errDial1 := executor.ensureUpstreamConn(context.Background(), nil, sess, "auth-1", wsURL, headers1)
-	if errDial1 != nil {
-		t.Fatalf("ensureUpstreamConn auth-1 error: %v", errDial1)
-	}
-	if conn1 == nil {
-		t.Fatal("ensureUpstreamConn auth-1 returned nil conn")
-	}
-
-	headers2 := http.Header{}
-	headers2.Set("Authorization", "Bearer token-2")
-	conn2, _, errDial2 := executor.ensureUpstreamConn(context.Background(), nil, sess, "auth-2", wsURL, headers2)
-	if errDial2 != nil {
-		t.Fatalf("ensureUpstreamConn auth-2 error: %v", errDial2)
-	}
-	if conn2 == nil {
-		t.Fatal("ensureUpstreamConn auth-2 returned nil conn")
-	}
-	if conn2 == conn1 {
-		t.Fatal("expected new websocket conn after auth switch")
-	}
-
-	defer executor.invalidateUpstreamConn(sess, conn2, "test_done", nil)
-
-	var got1, got2 string
-	select {
-	case got1 = <-authHeaderCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for first websocket handshake")
-	}
-	select {
-	case got2 = <-authHeaderCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for second websocket handshake")
-	}
-	if got1 != "Bearer token-1" {
-		t.Fatalf("first Authorization = %q, want %q", got1, "Bearer token-1")
-	}
-	if got2 != "Bearer token-2" {
-		t.Fatalf("second Authorization = %q, want %q", got2, "Bearer token-2")
-	}
-	if got1 == got2 {
-		t.Fatal("expected different Authorization headers after auth switch")
 	}
 }

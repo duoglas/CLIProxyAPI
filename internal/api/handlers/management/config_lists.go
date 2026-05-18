@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 )
 
 // Generic helpers for list[string]
@@ -163,6 +163,7 @@ func (h *Handler) PatchGeminiKey(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	targetIndex := -1
@@ -220,19 +221,46 @@ func (h *Handler) DeleteGeminiKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
-		out := make([]config.GeminiKey, 0, len(h.cfg.GeminiKey))
-		for _, v := range h.cfg.GeminiKey {
-			if v.APIKey != val {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.GeminiKey, 0, len(h.cfg.GeminiKey))
+			for _, v := range h.cfg.GeminiKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
 				out = append(out, v)
 			}
+			if len(out) != len(h.cfg.GeminiKey) {
+				h.cfg.GeminiKey = out
+				h.cfg.SanitizeGeminiKeys()
+				h.persistLocked(c)
+			} else {
+				c.JSON(404, gin.H{"error": "item not found"})
+			}
+			return
 		}
-		if len(out) != len(h.cfg.GeminiKey) {
-			h.cfg.GeminiKey = out
-			h.cfg.SanitizeGeminiKeys()
-			h.persistLocked(c)
-		} else {
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.GeminiKey {
+			if strings.TrimSpace(h.cfg.GeminiKey[i].APIKey) == val {
+				matchCount++
+				if matchIndex == -1 {
+					matchIndex = i
+				}
+			}
+		}
+		if matchCount == 0 {
 			c.JSON(404, gin.H{"error": "item not found"})
+			return
 		}
+		if matchCount > 1 {
+			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
+			return
+		}
+		h.cfg.GeminiKey = append(h.cfg.GeminiKey[:matchIndex], h.cfg.GeminiKey[matchIndex+1:]...)
+		h.cfg.SanitizeGeminiKeys()
+		h.persistLocked(c)
 		return
 	}
 	if idxStr := c.Query("index"); idxStr != "" {
@@ -296,6 +324,7 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	targetIndex := -1
@@ -347,14 +376,39 @@ func (h *Handler) PatchClaudeKey(c *gin.Context) {
 func (h *Handler) DeleteClaudeKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if val := c.Query("api-key"); val != "" {
-		out := make([]config.ClaudeKey, 0, len(h.cfg.ClaudeKey))
-		for _, v := range h.cfg.ClaudeKey {
-			if v.APIKey != val {
+	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.ClaudeKey, 0, len(h.cfg.ClaudeKey))
+			for _, v := range h.cfg.ClaudeKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
 				out = append(out, v)
 			}
+			h.cfg.ClaudeKey = out
+			h.cfg.SanitizeClaudeKeys()
+			h.persistLocked(c)
+			return
 		}
-		h.cfg.ClaudeKey = out
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.ClaudeKey {
+			if strings.TrimSpace(h.cfg.ClaudeKey[i].APIKey) == val {
+				matchCount++
+				if matchIndex == -1 {
+					matchIndex = i
+				}
+			}
+		}
+		if matchCount > 1 {
+			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
+			return
+		}
+		if matchIndex != -1 {
+			h.cfg.ClaudeKey = append(h.cfg.ClaudeKey[:matchIndex], h.cfg.ClaudeKey[matchIndex+1:]...)
+		}
 		h.cfg.SanitizeClaudeKeys()
 		h.persistLocked(c)
 		return
@@ -410,6 +464,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
 		Name          *string                             `json:"name"`
 		Prefix        *string                             `json:"prefix"`
+		Disabled      *bool                               `json:"disabled"`
 		BaseURL       *string                             `json:"base-url"`
 		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
 		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
@@ -424,6 +479,7 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	targetIndex := -1
@@ -450,6 +506,9 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 	if body.Value.Prefix != nil {
 		entry.Prefix = strings.TrimSpace(*body.Value.Prefix)
+	}
+	if body.Value.Disabled != nil {
+		entry.Disabled = *body.Value.Disabled
 	}
 	if body.Value.BaseURL != nil {
 		trimmed := strings.TrimSpace(*body.Value.BaseURL)
@@ -557,6 +616,7 @@ func (h *Handler) PatchVertexCompatKey(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	targetIndex := -1
@@ -625,13 +685,38 @@ func (h *Handler) DeleteVertexCompatKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
-		out := make([]config.VertexCompatKey, 0, len(h.cfg.VertexCompatAPIKey))
-		for _, v := range h.cfg.VertexCompatAPIKey {
-			if v.APIKey != val {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.VertexCompatKey, 0, len(h.cfg.VertexCompatAPIKey))
+			for _, v := range h.cfg.VertexCompatAPIKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
 				out = append(out, v)
 			}
+			h.cfg.VertexCompatAPIKey = out
+			h.cfg.SanitizeVertexCompatKeys()
+			h.persistLocked(c)
+			return
 		}
-		h.cfg.VertexCompatAPIKey = out
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.VertexCompatAPIKey {
+			if strings.TrimSpace(h.cfg.VertexCompatAPIKey[i].APIKey) == val {
+				matchCount++
+				if matchIndex == -1 {
+					matchIndex = i
+				}
+			}
+		}
+		if matchCount > 1 {
+			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
+			return
+		}
+		if matchIndex != -1 {
+			h.cfg.VertexCompatAPIKey = append(h.cfg.VertexCompatAPIKey[:matchIndex], h.cfg.VertexCompatAPIKey[matchIndex+1:]...)
+		}
 		h.cfg.SanitizeVertexCompatKeys()
 		h.persistLocked(c)
 		return
@@ -887,6 +972,7 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "invalid body"})
 		return
 	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	targetIndex := -1
@@ -945,14 +1031,39 @@ func (h *Handler) PatchCodexKey(c *gin.Context) {
 func (h *Handler) DeleteCodexKey(c *gin.Context) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if val := c.Query("api-key"); val != "" {
-		out := make([]config.CodexKey, 0, len(h.cfg.CodexKey))
-		for _, v := range h.cfg.CodexKey {
-			if v.APIKey != val {
+	if val := strings.TrimSpace(c.Query("api-key")); val != "" {
+		if baseRaw, okBase := c.GetQuery("base-url"); okBase {
+			base := strings.TrimSpace(baseRaw)
+			out := make([]config.CodexKey, 0, len(h.cfg.CodexKey))
+			for _, v := range h.cfg.CodexKey {
+				if strings.TrimSpace(v.APIKey) == val && strings.TrimSpace(v.BaseURL) == base {
+					continue
+				}
 				out = append(out, v)
 			}
+			h.cfg.CodexKey = out
+			h.cfg.SanitizeCodexKeys()
+			h.persistLocked(c)
+			return
 		}
-		h.cfg.CodexKey = out
+
+		matchIndex := -1
+		matchCount := 0
+		for i := range h.cfg.CodexKey {
+			if strings.TrimSpace(h.cfg.CodexKey[i].APIKey) == val {
+				matchCount++
+				if matchIndex == -1 {
+					matchIndex = i
+				}
+			}
+		}
+		if matchCount > 1 {
+			c.JSON(400, gin.H{"error": "multiple items match api-key; base-url is required"})
+			return
+		}
+		if matchIndex != -1 {
+			h.cfg.CodexKey = append(h.cfg.CodexKey[:matchIndex], h.cfg.CodexKey[matchIndex+1:]...)
+		}
 		h.cfg.SanitizeCodexKeys()
 		h.persistLocked(c)
 		return

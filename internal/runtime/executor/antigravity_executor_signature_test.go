@@ -4,26 +4,32 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
 
-func testMalformedClaudeSignature() string {
-	return base64.StdEncoding.EncodeToString([]byte{0x12, 0xff, 0xfe, 0xfd})
+func testGeminiSignaturePayload() string {
+	payload := append([]byte{0x0A}, bytes.Repeat([]byte{0x56}, 48)...)
+	return base64.StdEncoding.EncodeToString(payload)
 }
 
-func testAntigravitySignatureAuth(baseURL string) *cliproxyauth.Auth {
+// testFakeClaudeSignature returns a base64 string starting with 'E' that passes
+// the lightweight hasValidClaudeSignature check but has invalid protobuf content
+// (first decoded byte 0x12 is correct, but no valid protobuf field 2 follows),
+// so it fails deep validation in strict mode.
+func testFakeClaudeSignature() string {
+	return base64.StdEncoding.EncodeToString([]byte{0x12, 0xFF, 0xFE, 0xFD})
+}
+
+func testAntigravityAuth(baseURL string) *cliproxyauth.Auth {
 	return &cliproxyauth.Auth{
 		Attributes: map[string]string{
 			"base_url": baseURL,
@@ -37,14 +43,16 @@ func testAntigravitySignatureAuth(baseURL string) *cliproxyauth.Auth {
 
 func invalidClaudeThinkingPayload() []byte {
 	return []byte(`{
-		"model": "claude-sonnet-4-6",
-		"messages": [{
-			"role": "assistant",
-			"content": [
-				{"type": "thinking", "thinking": "bad", "signature": "` + testMalformedClaudeSignature() + `"},
-				{"type": "text", "text": "hello"}
-			]
-		}]
+		"model": "claude-sonnet-4-5-thinking",
+		"messages": [
+			{
+				"role": "assistant",
+				"content": [
+					{"type": "thinking", "thinking": "bad", "signature": "` + testFakeClaudeSignature() + `"},
+					{"type": "text", "text": "hello"}
+				]
+			}
+		]
 	}`)
 }
 
@@ -67,10 +75,10 @@ func TestAntigravityExecutor_StrictBypassRejectsInvalidSignature(t *testing.T) {
 	defer server.Close()
 
 	executor := NewAntigravityExecutor(nil)
-	auth := testAntigravitySignatureAuth(server.URL)
+	auth := testAntigravityAuth(server.URL)
 	payload := invalidClaudeThinkingPayload()
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), OriginalRequest: payload}
-	req := cliproxyexecutor.Request{Model: "claude-sonnet-4-6", Payload: payload}
+	req := cliproxyexecutor.Request{Model: "claude-sonnet-4-5-thinking", Payload: payload}
 
 	tests := []struct {
 		name   string
@@ -100,6 +108,7 @@ func TestAntigravityExecutor_StrictBypassRejectsInvalidSignature(t *testing.T) {
 	}
 
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			err := tt.invoke()
 			if err == nil {
@@ -130,65 +139,27 @@ func TestAntigravityExecutor_NonStrictBypassSkipsPrecheck(t *testing.T) {
 		cache.SetSignatureBypassStrictMode(previousStrict)
 	})
 
-	payload := bytes.Clone(invalidClaudeThinkingPayload())
+	payload := invalidClaudeThinkingPayload()
 	from := sdktranslator.FromString("claude")
 
-	if _, err := validateAntigravityRequestSignatures(from, payload); err != nil {
+	_, err := validateAntigravityRequestSignatures(from, payload)
+	if err != nil {
 		t.Fatalf("non-strict bypass should skip precheck, got: %v", err)
 	}
 }
 
-func TestAntigravityEnsureAccessToken_WarmTokenRefreshesCreditsHint(t *testing.T) {
-	authID := "auth-warm-token-credits-" + strings.ToLower(strings.ReplaceAll(t.Name(), "/", "-"))
-	executor := NewAntigravityExecutor(&config.Config{
-		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
+func TestAntigravityExecutor_CacheModeSkipsPrecheck(t *testing.T) {
+	previous := cache.SignatureCacheEnabled()
+	cache.SetSignatureCacheEnabled(true)
+	t.Cleanup(func() {
+		cache.SetSignatureCacheEnabled(previous)
 	})
-	auth := &cliproxyauth.Auth{
-		ID: authID,
-		Metadata: map[string]any{
-			"access_token": "token",
-			"expired":      time.Now().Add(1 * time.Hour).Format(time.RFC3339),
-		},
-	}
-	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.String() != "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" {
-			t.Fatalf("unexpected request url %s", req.URL.String())
-		}
-		if got := req.Header.Get("Authorization"); got != "Bearer token" {
-			t.Fatalf("Authorization = %q, want Bearer token", got)
-		}
-		body, _ := io.ReadAll(req.Body)
-		_ = req.Body.Close()
-		if !strings.Contains(string(body), `"ide_name":"antigravity"`) {
-			t.Fatalf("loadCodeAssist body missing ide metadata: %s", string(body))
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"paidTier":{"id":"tier-1","availableCredits":[{"creditType":"GOOGLE_ONE_AI","creditAmount":"25000","minimumCreditAmountForUsage":"50"}]}}`)),
-		}, nil
-	}))
 
-	token, updatedAuth, err := executor.ensureAccessToken(ctx, auth)
+	payload := invalidClaudeThinkingPayload()
+	from := sdktranslator.FromString("claude")
+
+	_, err := validateAntigravityRequestSignatures(from, payload)
 	if err != nil {
-		t.Fatalf("ensureAccessToken error: %v", err)
-	}
-	if token != "token" {
-		t.Fatalf("token = %q, want token", token)
-	}
-	if updatedAuth != nil {
-		t.Fatalf("updatedAuth = %v, want nil for warm token", updatedAuth)
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) && !cliproxyauth.HasKnownAntigravityCreditsHint(authID) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	hint, ok := cliproxyauth.GetAntigravityCreditsHint(authID)
-	if !ok || !hint.Known {
-		t.Fatal("expected credits hint to be populated")
-	}
-	if !hint.Available || hint.CreditAmount != 25000 || hint.MinCreditAmount != 50 || hint.PaidTierID != "tier-1" {
-		t.Fatalf("credits hint = %+v, want available tier-1 balance", hint)
+		t.Fatalf("cache mode should skip precheck, got: %v", err)
 	}
 }

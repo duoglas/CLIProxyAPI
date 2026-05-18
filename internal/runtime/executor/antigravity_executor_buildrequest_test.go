@@ -6,10 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	"github.com/tidwall/gjson"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 func TestAntigravityBuildRequest_SanitizesGeminiToolSchema(t *testing.T) {
@@ -38,66 +35,6 @@ func TestAntigravityBuildRequest_SanitizesAntigravityToolSchema(t *testing.T) {
 	assertSchemaSanitizedAndPropertyPreserved(t, params)
 }
 
-func TestAntigravityBuildRequest_CapsMaxOutputTokensToRegistryLimit(t *testing.T) {
-	t.Parallel()
-
-	const modelName = "claude-opus-4-6"
-	reg := registry.GetGlobalRegistry()
-	reg.RegisterClient("antigravity-buildrequest-cap", "antigravity", []*registry.ModelInfo{{
-		ID:                  modelName,
-		MaxCompletionTokens: 64000,
-	}})
-	t.Cleanup(func() {
-		reg.UnregisterClient("antigravity-buildrequest-cap")
-	})
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{}
-	payload := []byte(`{
-		"request": {
-			"generationConfig": {
-				"maxOutputTokens": 128000
-			}
-		}
-	}`)
-
-	req, err := executor.buildRequest(context.Background(), auth, "token", modelName, payload, false, "", "https://example.com")
-	if err != nil {
-		t.Fatalf("buildRequest error: %v", err)
-	}
-
-	raw, err := io.ReadAll(req.Body)
-	if err != nil {
-		t.Fatalf("read request body error: %v", err)
-	}
-
-	if got := gjson.GetBytes(raw, "request.generationConfig.maxOutputTokens").Int(); got != 64000 {
-		t.Fatalf("request.generationConfig.maxOutputTokens = %d, want %d", got, 64000)
-	}
-}
-
-func TestAntigravityBuildRequest_CreditsContextInjectsEnabledCreditTypes(t *testing.T) {
-	executor := &AntigravityExecutor{cfg: &config.Config{
-		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
-	}}
-	auth := &cliproxyauth.Auth{}
-	payload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
-
-	req, err := executor.buildRequest(cliproxyauth.WithAntigravityCredits(context.Background()), auth, "token", "claude-opus-4-6", payload, false, "", "https://example.com")
-	if err != nil {
-		t.Fatalf("buildRequest error: %v", err)
-	}
-
-	raw, err := io.ReadAll(req.Body)
-	if err != nil {
-		t.Fatalf("read request body error: %v", err)
-	}
-
-	if got := gjson.GetBytes(raw, "enabledCreditTypes.0").String(); got != "GOOGLE_ONE_AI" {
-		t.Fatalf("enabledCreditTypes.0 = %q, want GOOGLE_ONE_AI; body=%s", got, string(raw))
-	}
-}
-
 func TestAntigravityBuildRequest_SkipsSchemaSanitizationWithoutToolsField(t *testing.T) {
 	body := buildRequestBodyFromRawPayload(t, "gemini-3.1-flash-image", []byte(`{
 		"request": {
@@ -106,7 +43,9 @@ func TestAntigravityBuildRequest_SkipsSchemaSanitizationWithoutToolsField(t *tes
 					"role": "user",
 					"x-debug": "keep-me",
 					"parts": [
-						{"text": "hello"}
+						{
+							"text": "hello"
+						}
 					]
 				}
 			],
@@ -132,7 +71,9 @@ func TestAntigravityBuildRequest_SkipsSchemaSanitizationWithEmptyToolsArray(t *t
 					"role": "user",
 					"x-debug": "keep-me",
 					"parts": [
-						{"text": "hello"}
+						{
+							"text": "hello"
+						}
 					]
 				}
 			],

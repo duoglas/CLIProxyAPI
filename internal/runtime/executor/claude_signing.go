@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	xxHash64 "github.com/pierrec/xxHash/xxHash64"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -64,6 +64,15 @@ func resolveClaudeKeyConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config
 	}
 
 	return nil
+}
+
+// resolveClaudeKeyCloakConfig finds the matching ClaudeKey config and returns its CloakConfig.
+func resolveClaudeKeyCloakConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config.CloakConfig {
+	entry := resolveClaudeKeyConfig(cfg, auth)
+	if entry == nil {
+		return nil
+	}
+	return entry.Cloak
 }
 
 func experimentalCCHSigningEnabled(cfg *config.Config, auth *cliproxyauth.Auth) bool {

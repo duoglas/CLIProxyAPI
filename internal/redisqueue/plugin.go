@@ -3,14 +3,11 @@ package redisqueue
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
-	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 )
 
 func init() {
@@ -19,18 +16,11 @@ func init() {
 
 type usageQueuePlugin struct{}
 
-type queuedUsageDetail struct {
-	internalusage.RequestDetail
-	Provider  string `json:"provider"`
-	Model     string `json:"model"`
-	Endpoint  string `json:"endpoint"`
-	AuthType  string `json:"auth_type"`
-	APIKey    string `json:"api_key"`
-	RequestID string `json:"request_id"`
-}
-
 func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
-	if !Enabled() || !internalusage.StatisticsEnabled() {
+	if p == nil {
+		return
+	}
+	if !Enabled() || !UsageStatisticsEnabled() {
 		return
 	}
 
@@ -38,122 +28,137 @@ func (p *usageQueuePlugin) HandleUsage(ctx context.Context, record coreusage.Rec
 	if timestamp.IsZero() {
 		timestamp = time.Now()
 	}
+
+	modelName := strings.TrimSpace(record.Model)
+	if modelName == "" {
+		modelName = "unknown"
+	}
+	aliasName := strings.TrimSpace(record.Alias)
+	if aliasName == "" {
+		aliasName = modelName
+	}
 	provider := strings.TrimSpace(record.Provider)
 	if provider == "" {
 		provider = "unknown"
 	}
-	model := strings.TrimSpace(record.Model)
-	if model == "" {
-		model = "unknown"
-	}
 	authType := strings.TrimSpace(record.AuthType)
 	if authType == "" {
 		authType = "unknown"
+	}
+	apiKey := strings.TrimSpace(record.APIKey)
+	requestID := strings.TrimSpace(internallogging.GetRequestID(ctx))
+
+	tokens := tokenStats{
+		InputTokens:         record.Detail.InputTokens,
+		OutputTokens:        record.Detail.OutputTokens,
+		ReasoningTokens:     record.Detail.ReasoningTokens,
+		CachedTokens:        record.Detail.CachedTokens,
+		CacheReadTokens:     record.Detail.CacheReadTokens,
+		CacheCreationTokens: record.Detail.CacheCreationTokens,
+		TotalTokens:         record.Detail.TotalTokens,
+	}
+	if tokens.TotalTokens == 0 {
+		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
+	}
+	if tokens.TotalTokens == 0 {
+		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
 	}
 
 	failed := record.Failed
 	if !failed {
 		failed = !resolveSuccess(ctx)
 	}
-	detail := queuedUsageDetail{
-		RequestDetail: internalusage.RequestDetail{
-			Timestamp: timestamp,
-			LatencyMs: normaliseLatency(record.Latency),
-			Source:    record.Source,
-			ClientIP:  resolveClientIP(ctx),
-			AuthIndex: record.AuthIndex,
-			Tokens:    normaliseDetail(record.Detail),
-			Failed:    failed,
-		},
-		Provider:  provider,
-		Model:     model,
-		Endpoint:  resolveEndpoint(ctx),
-		AuthType:  authType,
-		APIKey:    record.APIKey,
-		RequestID: resolveRequestID(ctx),
+	fail := resolveFail(ctx, record, failed)
+
+	detail := requestDetail{
+		Timestamp: timestamp,
+		LatencyMs: record.Latency.Milliseconds(),
+		Source:    record.Source,
+		AuthIndex: record.AuthIndex,
+		Tokens:    tokens,
+		Failed:    failed,
+		Fail:      fail,
 	}
 
-	payload, err := json.Marshal(detail)
+	payload, err := json.Marshal(queuedUsageDetail{
+		requestDetail: detail,
+		Provider:      provider,
+		Model:         modelName,
+		Alias:         aliasName,
+		Endpoint:      resolveEndpoint(ctx),
+		AuthType:      authType,
+		APIKey:        apiKey,
+		RequestID:     requestID,
+	})
 	if err != nil {
 		return
 	}
 	Enqueue(payload)
 }
 
-func normaliseDetail(detail coreusage.Detail) internalusage.TokenStats {
-	tokens := internalusage.TokenStats{
-		InputTokens:     detail.InputTokens,
-		OutputTokens:    detail.OutputTokens,
-		ReasoningTokens: detail.ReasoningTokens,
-		CachedTokens:    detail.CachedTokens,
-		TotalTokens:     detail.TotalTokens,
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens + detail.CachedTokens
-	}
-	return tokens
+type queuedUsageDetail struct {
+	requestDetail
+	Provider  string `json:"provider"`
+	Model     string `json:"model"`
+	Alias     string `json:"alias"`
+	Endpoint  string `json:"endpoint"`
+	AuthType  string `json:"auth_type"`
+	APIKey    string `json:"api_key"`
+	RequestID string `json:"request_id"`
 }
 
-func normaliseLatency(latency time.Duration) int64 {
-	if latency <= 0 {
-		return 0
+type requestDetail struct {
+	Timestamp time.Time  `json:"timestamp"`
+	LatencyMs int64      `json:"latency_ms"`
+	Source    string     `json:"source"`
+	AuthIndex string     `json:"auth_index"`
+	Tokens    tokenStats `json:"tokens"`
+	Failed    bool       `json:"failed"`
+	Fail      failDetail `json:"fail"`
+}
+
+type tokenStats struct {
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	ReasoningTokens     int64 `json:"reasoning_tokens"`
+	CachedTokens        int64 `json:"cached_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_tokens"`
+	TotalTokens         int64 `json:"total_tokens"`
+}
+
+type failDetail struct {
+	StatusCode int    `json:"status_code"`
+	Body       string `json:"body"`
+}
+
+func resolveFail(ctx context.Context, record coreusage.Record, failed bool) failDetail {
+	fail := failDetail{
+		StatusCode: record.Fail.StatusCode,
+		Body:       strings.TrimSpace(record.Fail.Body),
 	}
-	return latency.Milliseconds()
+	if !failed {
+		return failDetail{StatusCode: 200}
+	}
+	if fail.StatusCode <= 0 {
+		fail.StatusCode = internallogging.GetResponseStatus(ctx)
+	}
+	if fail.StatusCode <= 0 {
+		fail.StatusCode = 500
+	}
+	return fail
 }
 
 func resolveSuccess(ctx context.Context) bool {
-	ginCtx := ginContext(ctx)
-	if ginCtx == nil {
-		return true
-	}
-	status := ginCtx.Writer.Status()
+	status := internallogging.GetResponseStatus(ctx)
 	if status == 0 {
 		return true
 	}
-	return status < http.StatusBadRequest
-}
-
-func resolveClientIP(ctx context.Context) string {
-	ginCtx := ginContext(ctx)
-	if ginCtx == nil || ginCtx.Request == nil {
-		return ""
-	}
-	return internallogging.ResolveClientIP(ginCtx)
+	return status < httpStatusBadRequest
 }
 
 func resolveEndpoint(ctx context.Context) string {
-	ginCtx := ginContext(ctx)
-	if ginCtx == nil || ginCtx.Request == nil {
-		return ""
-	}
-	path := ginCtx.FullPath()
-	if path == "" {
-		path = ginCtx.Request.URL.Path
-	}
-	method := ginCtx.Request.Method
-	if method == "" {
-		return path
-	}
-	if path == "" {
-		return method
-	}
-	return method + " " + path
+	return strings.TrimSpace(internallogging.GetEndpoint(ctx))
 }
 
-func resolveRequestID(ctx context.Context) string {
-	if requestID := internallogging.GetRequestID(ctx); requestID != "" {
-		return requestID
-	}
-	return internallogging.GetGinRequestID(ginContext(ctx))
-}
-
-func ginContext(ctx context.Context) *gin.Context {
-	if ctx == nil {
-		return nil
-	}
-	ginCtx, _ := ctx.Value("gin").(*gin.Context)
-	return ginCtx
-}
+const httpStatusBadRequest = 400

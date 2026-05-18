@@ -11,11 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
+	redisUsageChannel   = "usage"
 	respPreAuthTimeout  = 10 * time.Second
 	respIdleTimeout     = 2 * time.Minute
 	respMaxArrayItems   = 3
@@ -24,6 +25,11 @@ const (
 	respMaxPopCount     = 1000
 	respMaxAuthFailures = 5
 )
+
+type redisSubscriptionCommand struct {
+	args []string
+	err  error
+}
 
 func isRedisRESPPrefix(prefix byte) bool {
 	switch prefix {
@@ -35,177 +41,455 @@ func isRedisRESPPrefix(prefix byte) bool {
 }
 
 func (s *Server) handleRedisConnection(conn net.Conn, reader *bufio.Reader) {
-	defer func() { _ = conn.Close() }()
-	if conn == nil || reader == nil || s == nil || s.mgmt == nil {
+	if s == nil || conn == nil || reader == nil {
 		return
 	}
 
 	clientIP, localClient := resolveRemoteIP(conn.RemoteAddr())
-	authenticated := false
+	authed := false
 	authFailures := 0
-	for s.managementRoutesEnabled.Load() {
-		if authenticated {
-			_ = conn.SetReadDeadline(time.Now().Add(respIdleTimeout))
-		} else {
-			_ = conn.SetReadDeadline(time.Now().Add(respPreAuthTimeout))
+	writer := bufio.NewWriter(conn)
+	defer func() {
+		if errClose := conn.Close(); errClose != nil {
+			log.Errorf("redis connection close error: %v", errClose)
 		}
+	}()
+
+	flush := func() bool {
+		if errFlush := writer.Flush(); errFlush != nil {
+			log.Errorf("redis protocol flush error: %v", errFlush)
+			return false
+		}
+		return true
+	}
+	setReadDeadline := func() bool {
+		deadline := time.Now().Add(respPreAuthTimeout)
+		if authed {
+			deadline = time.Now().Add(respIdleTimeout)
+		}
+		if errDeadline := conn.SetReadDeadline(deadline); errDeadline != nil {
+			log.Errorf("redis protocol deadline error: %v", errDeadline)
+			return false
+		}
+		return true
+	}
+	recordAuthFailure := func() bool {
+		authFailures++
+		return authFailures >= respMaxAuthFailures
+	}
+
+	if s.cfg != nil && s.cfg.Home.Enabled {
+		_ = writeRedisError(writer, "ERR redis usage output disabled in home mode")
+		_ = writer.Flush()
+		return
+	}
+
+	for {
+		if !s.managementRoutesEnabled.Load() {
+			return
+		}
+
+		if !setReadDeadline() {
+			return
+		}
+
 		args, err := readRESPArray(reader)
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				log.WithError(err).Debug("failed reading RESP command")
+				_ = writeRedisError(writer, "ERR "+err.Error())
+				_ = writer.Flush()
 			}
 			return
 		}
 		if len(args) == 0 {
-			writeRESPError(conn, "ERR empty command")
+			_ = writeRedisError(writer, "ERR empty command")
+			if !flush() {
+				return
+			}
 			continue
 		}
 
-		command := strings.ToUpper(strings.TrimSpace(args[0]))
-		switch command {
-		case "AUTH":
-			password, err := parseAuthPassword(args)
-			if err != nil {
-				writeRESPError(conn, err.Error())
-				continue
-			}
-			ok, status, message := s.mgmt.AuthenticateManagementKey(clientIP, localClient, password)
-			if !ok {
-				authFailures++
-				if status == http.StatusUnauthorized {
-					writeRESPError(conn, "NOAUTH "+message)
+		cmd := strings.ToUpper(strings.TrimSpace(args[0]))
+
+		if cmd != "AUTH" && !authed {
+			closeAfterFailure := recordAuthFailure()
+			if s.mgmt != nil {
+				_, statusCode, errMsg := s.mgmt.AuthenticateManagementKey(clientIP, localClient, "")
+				if statusCode == http.StatusForbidden && strings.HasPrefix(errMsg, "IP banned due to too many failed attempts") {
+					_ = writeRedisError(writer, "ERR "+errMsg)
 				} else {
-					writeRESPError(conn, "ERR "+message)
+					_ = writeRedisError(writer, "NOAUTH Authentication required.")
 				}
-				if authFailures >= respMaxAuthFailures {
+			} else {
+				_ = writeRedisError(writer, "NOAUTH Authentication required.")
+			}
+			if !flush() {
+				return
+			}
+			if closeAfterFailure {
+				return
+			}
+			continue
+		}
+
+		switch cmd {
+		case "AUTH":
+			password, ok := parseAuthPassword(args)
+			if !ok {
+				closeAfterFailure := recordAuthFailure()
+				if s.mgmt != nil {
+					_, statusCode, errMsg := s.mgmt.AuthenticateManagementKey(clientIP, localClient, "")
+					if statusCode == http.StatusForbidden && strings.HasPrefix(errMsg, "IP banned due to too many failed attempts") {
+						_ = writeRedisError(writer, "ERR "+errMsg)
+						if !flush() {
+							return
+						}
+						if closeAfterFailure {
+							return
+						}
+						continue
+					}
+				}
+				_ = writeRedisError(writer, "ERR wrong number of arguments for 'auth' command")
+				if !flush() {
+					return
+				}
+				if closeAfterFailure {
 					return
 				}
 				continue
 			}
-			authenticated = true
-			authFailures = 0
-			writeRESPSimpleString(conn, "OK")
-
-		case "LPOP", "RPOP":
-			if !authenticated {
-				_, _, _ = s.mgmt.AuthenticateManagementKey(clientIP, localClient, "")
-				writeRESPRawError(conn, "NOAUTH Authentication required.")
+			if s.mgmt == nil {
+				closeAfterFailure := recordAuthFailure()
+				_ = writeRedisError(writer, "ERR remote management disabled")
+				if !flush() {
+					return
+				}
+				if closeAfterFailure {
+					return
+				}
 				continue
 			}
-			count, counted, err := parsePopCount(args)
-			if err != nil {
-				writeRESPError(conn, err.Error())
+			allowed, _, errMsg := s.mgmt.AuthenticateManagementKey(clientIP, localClient, password)
+			if !allowed {
+				closeAfterFailure := recordAuthFailure()
+				_ = writeRedisError(writer, "ERR "+errMsg)
+				if !flush() {
+					return
+				}
+				if closeAfterFailure {
+					return
+				}
+				continue
+			}
+			authed = true
+			authFailures = 0
+			_ = writeRedisSimpleString(writer, "OK")
+			if !flush() {
+				return
+			}
+		case "SUBSCRIBE":
+			if !authed {
+				_ = writeRedisError(writer, "NOAUTH Authentication required.")
+				if !flush() {
+					return
+				}
+				continue
+			}
+			channel, ok := parseSubscribeChannel(args)
+			if !ok {
+				_ = writeRedisError(writer, "ERR wrong number of arguments for 'subscribe' command")
+				if !flush() {
+					return
+				}
+				continue
+			}
+			if !strings.EqualFold(channel, redisUsageChannel) {
+				_ = writeRedisError(writer, fmt.Sprintf("ERR unsupported channel '%s'", channel))
+				if !flush() {
+					return
+				}
+				continue
+			}
+			messages, unsubscribe := redisqueue.SubscribeUsage()
+			if errWrite := writeRedisPubSubSubscribe(writer, redisUsageChannel, 1); errWrite != nil {
+				unsubscribe()
+				log.Errorf("redis protocol subscribe response error: %v", errWrite)
+				return
+			}
+			if !flush() {
+				unsubscribe()
+				return
+			}
+			s.streamRedisUsageSubscription(conn, reader, writer, messages, unsubscribe)
+			return
+		case "LPOP", "RPOP":
+			if !authed {
+				_ = writeRedisError(writer, "NOAUTH Authentication required.")
+				if !flush() {
+					return
+				}
+				continue
+			}
+			count, hasCount, ok := parsePopCount(args)
+			if !ok {
+				_ = writeRedisError(writer, "ERR wrong number of arguments for '"+strings.ToLower(cmd)+"' command")
+				if !flush() {
+					return
+				}
+				continue
+			}
+			if count <= 0 {
+				_ = writeRedisError(writer, "ERR value is not an integer or out of range")
+				if !flush() {
+					return
+				}
 				continue
 			}
 			var items [][]byte
-			if command == "RPOP" {
+			if cmd == "RPOP" {
 				items = redisqueue.PopNewest(count)
 			} else {
 				items = redisqueue.PopOldest(count)
 			}
-			if counted {
-				writeRESPArray(conn, items)
+			if hasCount {
+				_ = writeRedisArrayOfBulkStrings(writer, items)
+				if !flush() {
+					return
+				}
 				continue
 			}
 			if len(items) == 0 {
-				writeRESPNilBulk(conn)
+				_ = writeRedisNilBulkString(writer)
+				if !flush() {
+					return
+				}
 				continue
 			}
-			writeRESPBulk(conn, items[0])
-
-		case "PING":
-			writeRESPSimpleString(conn, "PONG")
-
+			_ = writeRedisBulkString(writer, items[0])
+			if !flush() {
+				return
+			}
 		default:
-			writeRESPError(conn, "ERR unknown command '"+command+"'")
+			_ = writeRedisError(writer, fmt.Sprintf("ERR unknown command '%s'", strings.ToLower(cmd)))
+			if !flush() {
+				return
+			}
 		}
 	}
 }
 
-func resolveRemoteIP(addr net.Addr) (string, bool) {
+func (s *Server) streamRedisUsageSubscription(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer, messages <-chan []byte, unsubscribe func()) {
+	if unsubscribe == nil {
+		return
+	}
+	defer unsubscribe()
+
+	done := make(chan struct{})
+	defer close(done)
+
+	commands := make(chan redisSubscriptionCommand, 1)
+	go readRedisSubscriptionCommands(conn, reader, commands, done)
+
+	for {
+		select {
+		case msg, ok := <-messages:
+			if !ok {
+				return
+			}
+			if errWrite := writeRedisPubSubMessage(writer, redisUsageChannel, msg); errWrite != nil {
+				log.Errorf("redis protocol publish message error: %v", errWrite)
+				return
+			}
+			if errFlush := writer.Flush(); errFlush != nil {
+				log.Errorf("redis protocol flush error: %v", errFlush)
+				return
+			}
+		case command, ok := <-commands:
+			if !ok {
+				return
+			}
+			keepOpen := handleRedisSubscriptionCommand(writer, command)
+			if errFlush := writer.Flush(); errFlush != nil {
+				log.Errorf("redis protocol flush error: %v", errFlush)
+				return
+			}
+			if !keepOpen {
+				return
+			}
+		}
+	}
+}
+
+func readRedisSubscriptionCommands(conn net.Conn, reader *bufio.Reader, commands chan<- redisSubscriptionCommand, done <-chan struct{}) {
+	defer close(commands)
+
+	for {
+		if conn != nil {
+			_ = conn.SetReadDeadline(time.Now().Add(respIdleTimeout))
+		}
+		args, err := readRESPArray(reader)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				select {
+				case commands <- redisSubscriptionCommand{err: err}:
+				case <-done:
+				}
+			}
+			return
+		}
+		select {
+		case commands <- redisSubscriptionCommand{args: args}:
+		case <-done:
+			return
+		}
+	}
+}
+
+func handleRedisSubscriptionCommand(writer *bufio.Writer, command redisSubscriptionCommand) bool {
+	if command.err != nil {
+		_ = writeRedisError(writer, "ERR "+command.err.Error())
+		return false
+	}
+	if len(command.args) == 0 {
+		_ = writeRedisError(writer, "ERR empty command")
+		return true
+	}
+
+	cmd := strings.ToUpper(strings.TrimSpace(command.args[0]))
+	switch cmd {
+	case "PING":
+		payload := []byte(nil)
+		if len(command.args) > 1 {
+			payload = []byte(command.args[1])
+		}
+		_ = writeRedisPubSubPong(writer, payload)
+		return true
+	case "UNSUBSCRIBE":
+		_ = writeRedisPubSubUnsubscribe(writer, redisUsageChannel, 0)
+		return false
+	case "QUIT":
+		_ = writeRedisSimpleString(writer, "OK")
+		return false
+	default:
+		_ = writeRedisError(writer, fmt.Sprintf("ERR unknown command '%s'", strings.ToLower(cmd)))
+		return true
+	}
+}
+
+func resolveRemoteIP(addr net.Addr) (ip string, localClient bool) {
 	if addr == nil {
 		return "", false
 	}
-	host, _, err := net.SplitHostPort(addr.String())
-	if err != nil {
-		host = addr.String()
-	}
-	ip := net.ParseIP(host)
-	local := ip != nil && ip.IsLoopback()
-	if ip == nil {
-		local = strings.EqualFold(host, "localhost")
-	}
-	return host, local
-}
 
-func parseAuthPassword(args []string) (string, error) {
-	switch len(args) {
-	case 2:
-		return args[1], nil
-	case 3:
-		return args[2], nil
-	default:
-		return "", fmt.Errorf("ERR wrong number of arguments for 'AUTH' command")
-	}
-}
-
-func parsePopCount(args []string) (int, bool, error) {
-	switch len(args) {
-	case 2:
-		return 1, false, nil
-	case 3:
-		count, err := strconv.Atoi(strings.TrimSpace(args[2]))
-		if err != nil || count <= 0 || count > respMaxPopCount {
-			return 0, false, fmt.Errorf("ERR value is not an integer or out of range")
+	var host string
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		if a != nil && a.IP != nil {
+			if ip4 := a.IP.To4(); ip4 != nil {
+				host = ip4.String()
+			} else {
+				host = a.IP.String()
+			}
 		}
-		return count, true, nil
 	default:
-		return 0, false, fmt.Errorf("ERR wrong number of arguments for '%s' command", strings.ToUpper(args[0]))
+		host = addr.String()
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		host = strings.TrimSpace(host)
+		if raw, _, ok := strings.Cut(host, "%"); ok {
+			host = raw
+		}
+		if parsed := net.ParseIP(host); parsed != nil {
+			if ip4 := parsed.To4(); ip4 != nil {
+				host = ip4.String()
+			} else {
+				host = parsed.String()
+			}
+		}
 	}
+
+	host = strings.TrimSpace(host)
+	localClient = host == "127.0.0.1" || host == "::1"
+	return host, localClient
+}
+
+func parseAuthPassword(args []string) (string, bool) {
+	switch len(args) {
+	case 2:
+		return args[1], true
+	case 3:
+		// Support AUTH <username> <password> by ignoring username for compatibility.
+		return args[2], true
+	default:
+		return "", false
+	}
+}
+
+func parseSubscribeChannel(args []string) (string, bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	return strings.TrimSpace(args[1]), true
+}
+
+func parsePopCount(args []string) (count int, hasCount bool, ok bool) {
+	if len(args) != 2 && len(args) != 3 {
+		return 0, false, false
+	}
+	if len(args) == 2 {
+		return 1, false, true
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(args[2]))
+	if err != nil {
+		return 0, true, true
+	}
+	if parsed > respMaxPopCount {
+		return 0, true, true
+	}
+	return parsed, true, true
 }
 
 func readRESPArray(reader *bufio.Reader) ([]string, error) {
+	prefix, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if prefix != '*' {
+		return nil, fmt.Errorf("protocol error")
+	}
 	line, err := readRESPLine(reader)
 	if err != nil {
 		return nil, err
 	}
-	if !strings.HasPrefix(line, "*") {
-		return nil, fmt.Errorf("expected RESP array")
-	}
-	count, err := strconv.Atoi(strings.TrimSpace(line[1:]))
+	count, err := strconv.Atoi(line)
 	if err != nil || count < 0 || count > respMaxArrayItems {
-		return nil, fmt.Errorf("invalid RESP array length")
+		return nil, fmt.Errorf("protocol error")
 	}
 	args := make([]string, 0, count)
 	for i := 0; i < count; i++ {
-		arg, err := readRESPString(reader)
+		value, err := readRESPString(reader)
 		if err != nil {
 			return nil, err
 		}
-		args = append(args, arg)
+		args = append(args, value)
 	}
 	return args, nil
 }
 
 func readRESPString(reader *bufio.Reader) (string, error) {
-	prefix, err := reader.Peek(1)
+	prefix, err := reader.ReadByte()
 	if err != nil {
 		return "", err
 	}
-	switch prefix[0] {
+	switch prefix {
 	case '$':
 		return readRESPBulkString(reader)
-	case '+', '-', ':':
-		line, err := readRESPLine(reader)
-		if err != nil {
-			return "", err
-		}
-		if len(line) == 0 {
-			return "", nil
-		}
-		return line[1:], nil
+	case '+', ':':
+		return readRESPLine(reader)
 	default:
-		return "", fmt.Errorf("unsupported RESP string type %q", prefix[0])
+		return "", fmt.Errorf("protocol error")
 	}
 }
 
@@ -214,22 +498,22 @@ func readRESPBulkString(reader *bufio.Reader) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !strings.HasPrefix(line, "$") {
-		return "", fmt.Errorf("expected RESP bulk string")
+	length, err := strconv.Atoi(line)
+	if err != nil {
+		return "", fmt.Errorf("protocol error")
 	}
-	length, err := strconv.Atoi(strings.TrimSpace(line[1:]))
-	if err != nil || length < -1 || length > respMaxBulkBytes {
-		return "", fmt.Errorf("invalid RESP bulk string length")
-	}
-	if length == -1 {
+	if length < 0 {
 		return "", nil
+	}
+	if length > respMaxBulkBytes {
+		return "", fmt.Errorf("protocol error")
 	}
 	buf := make([]byte, length+2)
 	if _, err := io.ReadFull(reader, buf); err != nil {
 		return "", err
 	}
-	if string(buf[length:]) != "\r\n" {
-		return "", fmt.Errorf("invalid RESP bulk string terminator")
+	if length+2 < 2 || buf[length] != '\r' || buf[length+1] != '\n' {
+		return "", fmt.Errorf("protocol error")
 	}
 	return string(buf[:length]), nil
 }
@@ -237,56 +521,143 @@ func readRESPBulkString(reader *bufio.Reader) (string, error) {
 func readRESPLine(reader *bufio.Reader) (string, error) {
 	var builder strings.Builder
 	for {
-		fragment, err := reader.ReadSlice('\n')
-		if len(fragment) > 0 {
-			if builder.Len()+len(fragment) > respMaxLineBytes {
-				return "", fmt.Errorf("RESP line too long")
+		part, err := reader.ReadSlice('\n')
+		if len(part) > 0 {
+			if builder.Len()+len(part) > respMaxLineBytes {
+				return "", fmt.Errorf("protocol error")
 			}
-			builder.Write(fragment)
+			_, _ = builder.Write(part)
+		}
+		if err == nil {
+			line := builder.String()
+			line = strings.TrimSuffix(line, "\n")
+			line = strings.TrimSuffix(line, "\r")
+			return line, nil
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
-		if err != nil {
-			return "", err
+		return "", err
+	}
+}
+
+func writeRedisSimpleString(writer *bufio.Writer, value string) error {
+	if writer == nil {
+		return net.ErrClosed
+	}
+	_, err := writer.WriteString("+" + value + "\r\n")
+	return err
+}
+
+func writeRedisError(writer *bufio.Writer, message string) error {
+	if writer == nil {
+		return net.ErrClosed
+	}
+	_, err := writer.WriteString("-" + message + "\r\n")
+	return err
+}
+
+func writeRedisNilBulkString(writer *bufio.Writer) error {
+	if writer == nil {
+		return net.ErrClosed
+	}
+	_, err := writer.WriteString("$-1\r\n")
+	return err
+}
+
+func writeRedisBulkString(writer *bufio.Writer, payload []byte) error {
+	if writer == nil {
+		return net.ErrClosed
+	}
+	if payload == nil {
+		return writeRedisNilBulkString(writer)
+	}
+	if _, err := writer.WriteString("$" + strconv.Itoa(len(payload)) + "\r\n"); err != nil {
+		return err
+	}
+	if _, err := writer.Write(payload); err != nil {
+		return err
+	}
+	_, err := writer.WriteString("\r\n")
+	return err
+}
+
+func writeRedisArrayOfBulkStrings(writer *bufio.Writer, items [][]byte) error {
+	if writer == nil {
+		return net.ErrClosed
+	}
+	if _, err := writer.WriteString("*" + strconv.Itoa(len(items)) + "\r\n"); err != nil {
+		return err
+	}
+	for i := range items {
+		if err := writeRedisBulkString(writer, items[i]); err != nil {
+			return err
 		}
-		break
 	}
-	line := builder.String()
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
-	return line, nil
+	return nil
 }
 
-func writeRESPSimpleString(w io.Writer, value string) {
-	_, _ = fmt.Fprintf(w, "+%s\r\n", value)
-}
-
-func writeRESPRawError(w io.Writer, message string) {
-	_, _ = fmt.Fprintf(w, "-%s\r\n", message)
-}
-
-func writeRESPError(w io.Writer, message string) {
-	if strings.HasPrefix(message, "ERR ") || strings.HasPrefix(message, "NOAUTH ") {
-		writeRESPRawError(w, message)
-		return
+func writeRedisInteger(writer *bufio.Writer, value int) error {
+	if writer == nil {
+		return net.ErrClosed
 	}
-	writeRESPRawError(w, "ERR "+message)
+	_, err := writer.WriteString(":" + strconv.Itoa(value) + "\r\n")
+	return err
 }
 
-func writeRESPNilBulk(w io.Writer) {
-	_, _ = io.WriteString(w, "$-1\r\n")
-}
-
-func writeRESPBulk(w io.Writer, payload []byte) {
-	_, _ = fmt.Fprintf(w, "$%d\r\n", len(payload))
-	_, _ = w.Write(payload)
-	_, _ = io.WriteString(w, "\r\n")
-}
-
-func writeRESPArray(w io.Writer, items [][]byte) {
-	_, _ = fmt.Fprintf(w, "*%d\r\n", len(items))
-	for _, item := range items {
-		writeRESPBulk(w, item)
+func writeRedisArrayHeader(writer *bufio.Writer, count int) error {
+	if writer == nil {
+		return net.ErrClosed
 	}
+	_, err := writer.WriteString("*" + strconv.Itoa(count) + "\r\n")
+	return err
+}
+
+func writeRedisPubSubSubscribe(writer *bufio.Writer, channel string, count int) error {
+	if err := writeRedisArrayHeader(writer, 3); err != nil {
+		return err
+	}
+	if err := writeRedisBulkString(writer, []byte("subscribe")); err != nil {
+		return err
+	}
+	if err := writeRedisBulkString(writer, []byte(channel)); err != nil {
+		return err
+	}
+	return writeRedisInteger(writer, count)
+}
+
+func writeRedisPubSubUnsubscribe(writer *bufio.Writer, channel string, count int) error {
+	if err := writeRedisArrayHeader(writer, 3); err != nil {
+		return err
+	}
+	if err := writeRedisBulkString(writer, []byte("unsubscribe")); err != nil {
+		return err
+	}
+	if err := writeRedisBulkString(writer, []byte(channel)); err != nil {
+		return err
+	}
+	return writeRedisInteger(writer, count)
+}
+
+func writeRedisPubSubMessage(writer *bufio.Writer, channel string, payload []byte) error {
+	if err := writeRedisArrayHeader(writer, 3); err != nil {
+		return err
+	}
+	if err := writeRedisBulkString(writer, []byte("message")); err != nil {
+		return err
+	}
+	if err := writeRedisBulkString(writer, []byte(channel)); err != nil {
+		return err
+	}
+	return writeRedisBulkString(writer, payload)
+}
+
+func writeRedisPubSubPong(writer *bufio.Writer, payload []byte) error {
+	if err := writeRedisArrayHeader(writer, 2); err != nil {
+		return err
+	}
+	if err := writeRedisBulkString(writer, []byte("pong")); err != nil {
+		return err
+	}
+	return writeRedisBulkString(writer, payload)
 }

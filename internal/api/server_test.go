@@ -1,9 +1,7 @@
 package api
 
 import (
-	"bytes"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,28 +11,14 @@ import (
 	"time"
 
 	gin "github.com/gin-gonic/gin"
-	proxyconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	proxyconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 )
-
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
-
-func stubDefaultTransport(t *testing.T, transport http.RoundTripper) {
-	t.Helper()
-
-	original := http.DefaultTransport
-	http.DefaultTransport = transport
-	t.Cleanup(func() {
-		http.DefaultTransport = original
-	})
-}
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
@@ -98,6 +82,94 @@ func TestHealthz(t *testing.T) {
 		}
 		if rr.Body.Len() != 0 {
 			t.Fatalf("expected empty body for HEAD request, got %q", rr.Body.String())
+		}
+	})
+}
+
+func TestManagementUsageRequiresManagementAuthAndPopsArray(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+
+	prevQueueEnabled := redisqueue.Enabled()
+	redisqueue.SetEnabled(false)
+	t.Cleanup(func() {
+		redisqueue.SetEnabled(false)
+		redisqueue.SetEnabled(prevQueueEnabled)
+	})
+
+	server := newTestServer(t)
+
+	redisqueue.Enqueue([]byte(`{"id":1}`))
+	redisqueue.Enqueue([]byte(`{"id":2}`))
+
+	missingKeyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
+	missingKeyRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(missingKeyRR, missingKeyReq)
+	if missingKeyRR.Code != http.StatusUnauthorized {
+		t.Fatalf("missing key status = %d, want %d body=%s", missingKeyRR.Code, http.StatusUnauthorized, missingKeyRR.Body.String())
+	}
+
+	legacyReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage?count=2", nil)
+	legacyReq.Header.Set("Authorization", "Bearer test-management-key")
+	legacyRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(legacyRR, legacyReq)
+	if legacyRR.Code != http.StatusNotFound {
+		t.Fatalf("legacy usage status = %d, want %d body=%s", legacyRR.Code, http.StatusNotFound, legacyRR.Body.String())
+	}
+
+	authReq := httptest.NewRequest(http.MethodGet, "/v0/management/usage-queue?count=2", nil)
+	authReq.Header.Set("Authorization", "Bearer test-management-key")
+	authRR := httptest.NewRecorder()
+	server.engine.ServeHTTP(authRR, authReq)
+	if authRR.Code != http.StatusOK {
+		t.Fatalf("authenticated status = %d, want %d body=%s", authRR.Code, http.StatusOK, authRR.Body.String())
+	}
+
+	var payload []json.RawMessage
+	if errUnmarshal := json.Unmarshal(authRR.Body.Bytes(), &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal response: %v body=%s", errUnmarshal, authRR.Body.String())
+	}
+	if len(payload) != 2 {
+		t.Fatalf("response records = %d, want 2", len(payload))
+	}
+	for i, raw := range payload {
+		var record struct {
+			ID int `json:"id"`
+		}
+		if errUnmarshal := json.Unmarshal(raw, &record); errUnmarshal != nil {
+			t.Fatalf("unmarshal record %d: %v", i, errUnmarshal)
+		}
+		if record.ID != i+1 {
+			t.Fatalf("record %d id = %d, want %d", i, record.ID, i+1)
+		}
+	}
+
+	if remaining := redisqueue.PopOldest(1); len(remaining) != 0 {
+		t.Fatalf("remaining queue = %q, want empty", remaining)
+	}
+}
+
+func TestHomeEnabledHidesManagementEndpointsAndControlPanel(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "test-management-key")
+
+	server := newTestServer(t)
+	server.cfg.Home.Enabled = true
+
+	t.Run("management endpoints return 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v0/management/config", nil)
+		req.Header.Set("Authorization", "Bearer test-management-key")
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
+		}
+	})
+
+	t.Run("management control panel returns 404", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+		rr := httptest.NewRecorder()
+		server.engine.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusNotFound, rr.Body.String())
 		}
 	})
 }
@@ -168,187 +240,139 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 	}
 }
 
-func TestGeminiCLIRouteDisabledByDefault(t *testing.T) {
+func TestModelsWithClientVersionReturnsCodexCatalog(t *testing.T) {
+	modelRegistry := registry.GetGlobalRegistry()
+	clientID := "test-client-version-catalog"
+	modelRegistry.RegisterClient(clientID, "openai", []*registry.ModelInfo{
+		{
+			ID:            "gpt-5.5",
+			Object:        "model",
+			Created:       1776902400,
+			OwnedBy:       "openai",
+			Type:          "openai",
+			DisplayName:   "GPT 5.5",
+			Description:   "Frontier model for complex coding, research, and real-world work.",
+			ContextLength: 272000,
+			Thinking:      &registry.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}},
+		},
+		{
+			ID:            "custom-codex-model-test",
+			Object:        "model",
+			OwnedBy:       "test",
+			Type:          "openai",
+			DisplayName:   "Custom Codex Model",
+			Description:   "Custom model from registry",
+			ContextLength: 123456,
+			Thinking:      &registry.ThinkingSupport{Levels: []string{"low", "medium"}},
+		},
+		{ID: "grok-imagine-image-quality", Object: "model", OwnedBy: "xai", Type: "openai"},
+		{ID: "gpt-image-2", Object: "model", OwnedBy: "openai", Type: "openai"},
+		{ID: "grok-imagine-image", Object: "model", OwnedBy: "xai", Type: "openai"},
+		{ID: "grok-imagine-video", Object: "model", OwnedBy: "xai", Type: "openai"},
+	})
+	t.Cleanup(func() {
+		modelRegistry.UnregisterClient(clientID)
+	})
+
 	server := newTestServer(t)
 
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1internal:generateContent", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.RemoteAddr = "127.0.0.1:4567"
-
-	rr := httptest.NewRecorder()
-	server.engine.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "Gemini CLI endpoint is disabled") {
-		t.Fatalf("body = %q, want disabled endpoint error", rr.Body.String())
-	}
-}
-
-func TestGeminiCLIRouteRejectsNonLocalWhenEnabled(t *testing.T) {
-	server := newTestServer(t)
-	server.cfg.EnableGeminiCLIEndpoint = true
-
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1internal:generateContent", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.RemoteAddr = "203.0.113.7:4567"
-
-	rr := httptest.NewRecorder()
-	server.engine.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusForbidden, rr.Body.String())
-	}
-	if !strings.Contains(rr.Body.String(), "CLI reply only allow local access") {
-		t.Fatalf("body = %q, want local access error", rr.Body.String())
-	}
-}
-
-func TestGeminiCLIPassthroughPreservesAuthorizationForLocalEndpoint(t *testing.T) {
-	server := newTestServer(t)
-	server.cfg.EnableGeminiCLIEndpoint = true
-
-	var upstreamAuthorization string
-	stubDefaultTransport(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		upstreamAuthorization = req.Header.Get("Authorization")
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
-			Request:    req,
-		}, nil
-	}))
-
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1internal:countTokens", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer upstream-token")
-	req.RemoteAddr = "127.0.0.1:4567"
+	req := httptest.NewRequest(http.MethodGet, "/v1/models?client_version", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("User-Agent", "claude-cli/1.0")
 
 	rr := httptest.NewRecorder()
 	server.engine.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
-	}
-	if upstreamAuthorization != "Bearer upstream-token" {
-		t.Fatalf("upstream Authorization = %q, want %q", upstreamAuthorization, "Bearer upstream-token")
-	}
-}
-
-func TestGeminiCLIRouteAllowsLoopbackHostForms(t *testing.T) {
-	tests := []struct {
-		name       string
-		targetURL  string
-		remoteAddr string
-	}{
-		{name: "localhost host", targetURL: "http://localhost/v1internal:countTokens", remoteAddr: "127.0.0.1:4567"},
-		{name: "localhost with port", targetURL: "http://localhost:8080/v1internal:countTokens", remoteAddr: "127.0.0.1:4567"},
-		{name: "ipv6 loopback", targetURL: "http://[::1]:8080/v1internal:countTokens", remoteAddr: "[::1]:4567"},
+		t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
 	}
 
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			server := newTestServer(t)
-			server.cfg.EnableGeminiCLIEndpoint = true
-
-			stubDefaultTransport(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     make(http.Header),
-					Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
-					Request:    req,
-				}, nil
-			}))
-
-			req := httptest.NewRequest(http.MethodPost, tc.targetURL, bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
-			req.Header.Set("Content-Type", "application/json")
-			req.RemoteAddr = tc.remoteAddr
-
-			rr := httptest.NewRecorder()
-			server.engine.ServeHTTP(rr, req)
-
-			if rr.Code != http.StatusOK {
-				t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
-			}
-		})
+	var resp struct {
+		Models []map[string]any `json:"models"`
+		Object string           `json:"object"`
+		Data   []any            `json:"data"`
 	}
-}
-
-func TestGeminiCLIPassthroughFiltersHopByHopHeaders(t *testing.T) {
-	server := newTestServer(t)
-	server.cfg.EnableGeminiCLIEndpoint = true
-
-	var upstreamHeaders http.Header
-	stubDefaultTransport(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		upstreamHeaders = req.Header.Clone()
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
-			Request:    req,
-		}, nil
-	}))
-
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1internal:countTokens", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer upstream-token")
-	req.Header.Set("Connection", "keep-alive, X-Hop")
-	req.Header.Set("X-Hop", "drop-me")
-	req.Header.Set("Transfer-Encoding", "chunked")
-	req.RemoteAddr = "127.0.0.1:4567"
-
-	rr := httptest.NewRecorder()
-	server.engine.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to parse response JSON: %v; body=%s", err, rr.Body.String())
 	}
-	if upstreamHeaders.Get("Authorization") != "Bearer upstream-token" {
-		t.Fatalf("Authorization = %q, want preserved upstream token", upstreamHeaders.Get("Authorization"))
+	if resp.Object != "" || resp.Data != nil {
+		t.Fatalf("expected codex catalog format without object/data, got object=%q data=%v", resp.Object, resp.Data)
 	}
-	if upstreamHeaders.Get("Connection") != "" || upstreamHeaders.Get("Transfer-Encoding") != "" || upstreamHeaders.Get("X-Hop") != "" {
-		t.Fatalf("hop-by-hop headers leaked upstream: %v", upstreamHeaders)
+	if len(resp.Models) == 0 {
+		t.Fatal("expected codex catalog models")
 	}
-}
 
-func TestGeminiCLIPassthroughPreservesGoogleAPIKeyForLocalEndpoint(t *testing.T) {
-	server := newTestServer(t)
-	server.cfg.EnableGeminiCLIEndpoint = true
-
-	var (
-		upstreamAuthorization string
-		upstreamGoogleAPIKey  string
-	)
-	stubDefaultTransport(t, roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		upstreamAuthorization = req.Header.Get("Authorization")
-		upstreamGoogleAPIKey = req.Header.Get("X-Goog-Api-Key")
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"status":"ok"}`)),
-			Request:    req,
-		}, nil
-	}))
-
-	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/v1internal:countTokens", bytes.NewBufferString(`{"model":"gemini-2.5-pro"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Goog-Api-Key", "upstream-key")
-	req.Header.Set("Authorization", "Bearer upstream-token")
-	req.RemoteAddr = "127.0.0.1:4567"
-
-	rr := httptest.NewRecorder()
-	server.engine.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	var gpt55 map[string]any
+	var custom map[string]any
+	for _, model := range resp.Models {
+		switch slug, _ := model["slug"].(string); slug {
+		case "gpt-5.5":
+			gpt55 = model
+		case "custom-codex-model-test":
+			custom = model
+		}
 	}
-	if upstreamAuthorization != "Bearer upstream-token" {
-		t.Fatalf("upstream Authorization = %q, want %q", upstreamAuthorization, "Bearer upstream-token")
+	if gpt55 == nil {
+		t.Fatal("expected gpt-5.5 codex catalog entry")
 	}
-	if upstreamGoogleAPIKey != "upstream-key" {
-		t.Fatalf("upstream X-Goog-Api-Key = %q, want %q", upstreamGoogleAPIKey, "upstream-key")
+	if _, ok := gpt55["minimal_client_version"]; !ok {
+		t.Fatal("expected minimal_client_version in codex catalog")
+	}
+	serviceTiers, ok := gpt55["service_tiers"].([]any)
+	if !ok || len(serviceTiers) != 1 {
+		t.Fatalf("expected gpt-5.5 priority service tier, got %#v", gpt55["service_tiers"])
+	}
+	if custom == nil {
+		t.Fatal("expected custom model codex catalog entry")
+	}
+	if got, _ := custom["display_name"].(string); got != "Custom Codex Model" {
+		t.Fatalf("custom display_name = %q, want Custom Codex Model", got)
+	}
+	if got, _ := custom["description"].(string); got != "Custom model from registry" {
+		t.Fatalf("custom description = %q, want Custom model from registry", got)
+	}
+	if got, _ := custom["context_window"].(float64); got != 123456 {
+		t.Fatalf("custom context_window = %v, want 123456", custom["context_window"])
+	}
+	if custom["base_instructions"] != gpt55["base_instructions"] {
+		t.Fatal("expected custom model to use gpt-5.5 base_instructions fallback")
+	}
+	if _, ok := custom["available_in_plans"].([]any); !ok {
+		t.Fatalf("expected custom model to use gpt-5.5 available_in_plans fallback, got %#v", custom["available_in_plans"])
+	}
+	if got, _ := custom["prefer_websockets"].(bool); got {
+		t.Fatalf("custom prefer_websockets = %v, want false", custom["prefer_websockets"])
+	}
+	if _, ok := custom["apply_patch_tool_type"]; ok {
+		t.Fatal("expected custom model to omit apply_patch_tool_type")
+	}
+	if _, ok := custom["upgrade"]; ok {
+		t.Fatal("expected custom model to omit upgrade")
+	}
+	if _, ok := custom["availability_nux"]; ok {
+		t.Fatal("expected custom model to omit availability_nux")
+	}
+
+	hiddenModels := map[string]bool{
+		"grok-imagine-image-quality": false,
+		"gpt-image-2":                false,
+		"grok-imagine-image":         false,
+		"grok-imagine-video":         false,
+	}
+	for _, model := range resp.Models {
+		slug, _ := model["slug"].(string)
+		if _, ok := hiddenModels[slug]; !ok {
+			continue
+		}
+		if visibility, _ := model["visibility"].(string); visibility != "hide" {
+			t.Fatalf("%s visibility = %q, want hide", slug, visibility)
+		}
+		hiddenModels[slug] = true
+	}
+	for slug, found := range hiddenModels {
+		if !found {
+			t.Fatalf("expected hidden model %s in codex catalog", slug)
+		}
 	}
 }
 
@@ -409,6 +433,8 @@ func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 		http.StatusBadGateway,
 		map[string][]string{"Content-Type": []string{"application/json"}},
 		[]byte(`{"error":"upstream failure"}`),
+		nil,
+		nil,
 		nil,
 		nil,
 		nil,
