@@ -8,24 +8,25 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
-	internalusage "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	sdkusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/wsrelay"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 // Service wraps the proxy server lifecycle so external programs can embed the CLI proxy.
@@ -37,6 +38,9 @@ type Service struct {
 
 	// cfgMu protects concurrent access to the configuration.
 	cfgMu sync.RWMutex
+
+	// configUpdateMu serializes config updates across watcher + home.
+	configUpdateMu sync.Mutex
 
 	// configPath is the path to the configuration file.
 	configPath string
@@ -77,18 +81,6 @@ type Service struct {
 	// authQueueStop cancels the auth update queue processing.
 	authQueueStop context.CancelFunc
 
-	// usagePersistenceMu protects the periodic persistence loop lifecycle.
-	usagePersistenceMu sync.Mutex
-
-	// usagePersistenceCancel stops the periodic usage persistence loop.
-	usagePersistenceCancel context.CancelFunc
-
-	// usagePersistenceDone is closed when the periodic usage persistence loop exits.
-	usagePersistenceDone chan struct{}
-
-	// usageStats optionally overrides the shared usage statistics store for tests.
-	usageStats *internalusage.RequestStatistics
-
 	// authManager handles legacy authentication operations.
 	authManager *sdkAuth.Manager
 
@@ -104,107 +96,8 @@ type Service struct {
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
 
-	// maintenanceCancel stops the optional auth maintenance worker.
-	maintenanceCancel context.CancelFunc
-
-	// maintenanceMu protects auth maintenance queue state.
-	maintenanceMu sync.Mutex
-
-	// maintenanceQueue stores pending auth maintenance deletions in FIFO order.
-	maintenanceQueue []authMaintenanceCandidate
-
-	// maintenancePending deduplicates queued auth files by canonical path.
-	maintenancePending map[string]struct{}
-
-	// maintenanceInFlight tracks auth files currently being deleted.
-	maintenanceInFlight map[string]struct{}
-
-	// maintenanceAuthIDsByPath caches auth ids by backing file path.
-	maintenanceAuthIDsByPath map[string]map[string]struct{}
-
-	// maintenanceAuthPathByID stores the reverse lookup for cache updates.
-	maintenanceAuthPathByID map[string]string
-
-	// maintenanceWake nudges the maintenance loop when new candidates arrive.
-	maintenanceWake chan struct{}
-
-	// maintenanceHookOnce ensures the auth maintenance hook is installed once.
-	maintenanceHookOnce sync.Once
-}
-
-const (
-	defaultMaintenanceScanIntervalSeconds    = 30
-	defaultMaintenanceDeleteIntervalSeconds  = 5
-	defaultMaintenanceQuotaStrikeThreshold   = 6
-	authMaintenancePendingDeleteMetadataKey  = "auth_maintenance_pending_delete"
-	authMaintenanceDeleteReasonMetadataKey   = "auth_maintenance_delete_reason"
-	authMaintenanceDeleteQueuedAtMetadataKey = "auth_maintenance_delete_queued_at"
-	authMaintenanceDeleteMinSpacing          = 250 * time.Millisecond
-	authMaintenanceDeleteSuppressWindow      = 2 * time.Second
-)
-
-type authMaintenanceCandidate struct {
-	Key    string
-	Path   string
-	IDs    []string
-	Reason string
-}
-
-type authMaintenanceHook struct {
-	next    coreauth.Hook
-	service *Service
-}
-
-type skipAuthLifecycleSyncContextKey struct{}
-
-func withSkipAuthLifecycleSync(ctx context.Context) context.Context {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, skipAuthLifecycleSyncContextKey{}, true)
-}
-
-func shouldSkipAuthLifecycleSync(ctx context.Context) bool {
-	if ctx == nil {
-		return false
-	}
-	skip, _ := ctx.Value(skipAuthLifecycleSyncContextKey{}).(bool)
-	return skip
-}
-
-func (h authMaintenanceHook) OnAuthRegistered(ctx context.Context, auth *coreauth.Auth) {
-	if h.next != nil {
-		h.next.OnAuthRegistered(ctx, auth)
-	}
-	if h.service != nil && auth != nil && auth.ID != "" && !shouldSkipAuthLifecycleSync(ctx) {
-		h.service.emitAuthUpdate(ctx, watcher.AuthUpdate{
-			Action: watcher.AuthUpdateActionAdd,
-			ID:     auth.ID,
-			Auth:   auth.Clone(),
-		})
-	}
-}
-
-func (h authMaintenanceHook) OnAuthUpdated(ctx context.Context, auth *coreauth.Auth) {
-	if h.next != nil {
-		h.next.OnAuthUpdated(ctx, auth)
-	}
-	if h.service != nil && auth != nil && auth.ID != "" && !shouldSkipAuthLifecycleSync(ctx) {
-		h.service.emitAuthUpdate(ctx, watcher.AuthUpdate{
-			Action: watcher.AuthUpdateActionModify,
-			ID:     auth.ID,
-			Auth:   auth.Clone(),
-		})
-	}
-}
-
-func (h authMaintenanceHook) OnResult(ctx context.Context, result coreauth.Result) {
-	if h.next != nil {
-		h.next.OnResult(ctx, result)
-	}
-	if h.service != nil {
-		h.service.handleAuthMaintenanceResult(ctx, result)
-	}
+	homeClient *home.Client
+	homeCancel context.CancelFunc
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -212,8 +105,19 @@ func (h authMaintenanceHook) OnResult(ctx context.Context, result coreauth.Resul
 //
 // Parameters:
 //   - plugin: The usage plugin to register
-func (s *Service) RegisterUsagePlugin(plugin sdkusage.Plugin) {
-	sdkusage.RegisterPlugin(plugin)
+func (s *Service) RegisterUsagePlugin(plugin usage.Plugin) {
+	usage.RegisterPlugin(plugin)
+}
+
+func authAutoRefreshWorkersFromConfig(cfg *config.Config) int {
+	if cfg == nil {
+		return 0
+	}
+	return cfg.AuthAutoRefreshWorkers
+}
+
+func shouldRestartCoreAutoRefresh(previousWorkers, nextWorkers int) bool {
+	return previousWorkers != nextWorkers
 }
 
 // newDefaultAuthManager creates a default authentication manager with all supported providers.
@@ -223,190 +127,8 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewGeminiAuthenticator(),
 		sdkAuth.NewCodexAuthenticator(),
 		sdkAuth.NewClaudeAuthenticator(),
-		sdkAuth.NewQwenAuthenticator(),
+		sdkAuth.NewXAIAuthenticator(),
 	)
-}
-
-const usagePersistenceDisabledPollInterval = 5 * time.Second
-
-func usagePersistenceIntervalForConfig(cfg *config.Config) time.Duration {
-	if cfg == nil || cfg.UsageStatisticsPersistIntervalSeconds <= 0 {
-		return 0
-	}
-	return time.Duration(cfg.UsageStatisticsPersistIntervalSeconds) * time.Second
-}
-
-func (s *Service) currentConfig() *config.Config {
-	if s == nil {
-		return nil
-	}
-	s.cfgMu.RLock()
-	defer s.cfgMu.RUnlock()
-	return s.cfg
-}
-
-func (s *Service) usageStatisticsEnabled() bool {
-	cfg := s.currentConfig()
-	return cfg != nil && cfg.UsageStatisticsEnabled
-}
-
-func (s *Service) usagePersistenceInterval() time.Duration {
-	return usagePersistenceIntervalForConfig(s.currentConfig())
-}
-
-func (s *Service) usageStatisticsFilePath() string {
-	cfg := s.currentConfig()
-	if cfg == nil {
-		return ""
-	}
-	return internalusage.StatisticsFilePath(cfg)
-}
-
-func (s *Service) usageStatisticsStore() *internalusage.RequestStatistics {
-	if s != nil && s.usageStats != nil {
-		return s.usageStats
-	}
-	return internalusage.GetRequestStatistics()
-}
-
-func (s *Service) restoreUsageStatistics() {
-	if s == nil || !s.usageStatisticsEnabled() {
-		return
-	}
-	path := s.usageStatisticsFilePath()
-	if strings.TrimSpace(path) == "" {
-		return
-	}
-	loaded, result, err := internalusage.RestoreRequestStatistics(path, s.usageStatisticsStore())
-	if err != nil {
-		log.WithError(err).Warnf("failed to restore usage statistics from %s", path)
-		return
-	}
-	if loaded {
-		log.Infof("usage statistics restored from %s (added=%d skipped=%d)", path, result.Added, result.Skipped)
-	}
-}
-
-func (s *Service) persistUsageStatistics(reason string) {
-	if s == nil {
-		return
-	}
-	path := s.usageStatisticsFilePath()
-	if strings.TrimSpace(path) == "" {
-		return
-	}
-	saved, err := internalusage.PersistRequestStatistics(path, s.usageStatisticsStore())
-	if err != nil {
-		log.WithError(err).Warnf("failed to persist usage statistics during %s", reason)
-		return
-	}
-	if !saved {
-		return
-	}
-	switch reason {
-	case "shutdown":
-		log.Infof("usage statistics persisted to %s during shutdown", path)
-	default:
-		log.Debugf("usage statistics persisted to %s (%s)", path, reason)
-	}
-}
-
-func (s *Service) nextUsagePersistenceWait() time.Duration {
-	if !s.usageStatisticsEnabled() {
-		return usagePersistenceDisabledPollInterval
-	}
-	interval := s.usagePersistenceInterval()
-	if interval <= 0 {
-		return usagePersistenceDisabledPollInterval
-	}
-	return interval
-}
-
-func (s *Service) startUsagePersistenceLoop() {
-	if s == nil {
-		return
-	}
-
-	s.usagePersistenceMu.Lock()
-	defer s.usagePersistenceMu.Unlock()
-	if s.usagePersistenceCancel != nil {
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	s.usagePersistenceCancel = cancel
-	s.usagePersistenceDone = done
-
-	go func() {
-		defer close(done)
-		for {
-			wait := s.nextUsagePersistenceWait()
-			timer := time.NewTimer(wait)
-			select {
-			case <-ctx.Done():
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				return
-			case <-timer.C:
-			}
-
-			if s.usageStatisticsEnabled() && s.usagePersistenceInterval() > 0 {
-				s.persistUsageStatistics("periodic")
-			}
-		}
-	}()
-}
-
-func (s *Service) restartUsagePersistenceLoop() {
-	if s == nil {
-		return
-	}
-	s.stopUsagePersistenceLoop()
-	s.startUsagePersistenceLoop()
-}
-
-func (s *Service) applyUsagePersistenceConfigChange(previousEnabled bool, previousInterval time.Duration, newCfg *config.Config) {
-	if s == nil || newCfg == nil {
-		return
-	}
-
-	currentEnabled := newCfg.UsageStatisticsEnabled
-	currentInterval := usagePersistenceIntervalForConfig(newCfg)
-
-	if previousEnabled && !currentEnabled {
-		s.persistUsageStatistics("disable")
-	}
-	if !previousEnabled && currentEnabled {
-		s.restoreUsageStatistics()
-	}
-	if previousEnabled != currentEnabled || previousInterval != currentInterval {
-		s.restartUsagePersistenceLoop()
-	}
-}
-
-func (s *Service) stopUsagePersistenceLoop() {
-	if s == nil {
-		return
-	}
-
-	s.usagePersistenceMu.Lock()
-	cancel := s.usagePersistenceCancel
-	done := s.usagePersistenceDone
-	s.usagePersistenceCancel = nil
-	s.usagePersistenceDone = nil
-	s.usagePersistenceMu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	if done != nil {
-		<-done
-	}
 }
 
 func (s *Service) ensureAuthUpdateQueue(ctx context.Context) {
@@ -574,7 +296,6 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
 		return
 	}
-	ctx = withSkipAuthLifecycleSync(ctx)
 	auth = auth.Clone()
 	s.ensureExecutorsForAuth(auth)
 
@@ -611,78 +332,33 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// This operation may block on network calls, but the auth configuration
 	// is already effective at this point.
 	s.registerModelsForAuth(auth)
+	s.coreManager.ReconcileRegistryModelStates(ctx, auth.ID)
 
 	// Refresh the scheduler entry so that the auth's supportedModelSet is rebuilt
 	// from the now-populated global model registry. Without this, newly added auths
 	// have an empty supportedModelSet (because Register/Update upserts into the
 	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
 	s.coreManager.RefreshSchedulerEntry(auth.ID)
-	s.indexAuthMaintenanceAuth(auth)
 }
 
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
-	s.applyCoreAuthRemovalWithReason(ctx, id, "", false)
-}
-
-func (s *Service) applyCoreAuthRemovalWithReason(ctx context.Context, id string, reason string, pendingDelete bool) {
-	if s == nil || strings.TrimSpace(id) == "" || s.coreManager == nil {
+	if s == nil || id == "" {
 		return
 	}
-	if ctx == nil {
-		ctx = context.Background()
+	if s.coreManager == nil {
+		return
 	}
-	id = strings.TrimSpace(id)
 	GlobalModelRegistry().UnregisterClient(id)
-	existing, ok := s.coreManager.GetByID(id)
-	if !ok || existing == nil {
-		s.removeAuthMaintenanceAuth(id)
-		return
-	}
-	alreadyDisabled := existing.Disabled && existing.Status == coreauth.StatusDisabled && existing.Unavailable
-	existingPending := authMaintenancePendingDelete(existing)
-	existingReason, _ := authMaintenancePendingDeleteReason(existing)
-	normalizedReason := strings.TrimSpace(reason)
-	if alreadyDisabled && existingPending == pendingDelete && (!pendingDelete || existingReason == normalizedReason) {
-		if pendingDelete {
-			s.indexAuthMaintenanceAuth(existing)
-		} else {
-			s.removeAuthMaintenanceAuth(id)
+	if existing, ok := s.coreManager.GetByID(id); ok && existing != nil {
+		existing.Disabled = true
+		existing.Status = coreauth.StatusDisabled
+		if _, err := s.coreManager.Update(ctx, existing); err != nil {
+			log.Errorf("failed to disable auth %s: %v", id, err)
 		}
-		return
-	}
-	existing.Disabled = true
-	existing.Status = coreauth.StatusDisabled
-	existing.Unavailable = true
-	existing.UpdatedAt = time.Now().UTC()
-	if existing.Metadata == nil && pendingDelete {
-		existing.Metadata = make(map[string]any)
-	}
-	if existing.Metadata != nil {
-		existing.Metadata["disabled"] = true
-		if pendingDelete {
-			existing.Metadata[authMaintenancePendingDeleteMetadataKey] = true
-			if reason = strings.TrimSpace(reason); reason != "" {
-				existing.Metadata[authMaintenanceDeleteReasonMetadataKey] = reason
-			} else {
-				delete(existing.Metadata, authMaintenanceDeleteReasonMetadataKey)
-			}
-			existing.Metadata[authMaintenanceDeleteQueuedAtMetadataKey] = existing.UpdatedAt.Format(time.RFC3339Nano)
-		} else {
-			delete(existing.Metadata, authMaintenancePendingDeleteMetadataKey)
-			delete(existing.Metadata, authMaintenanceDeleteReasonMetadataKey)
-			delete(existing.Metadata, authMaintenanceDeleteQueuedAtMetadataKey)
+		if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
+			executor.CloseCodexWebsocketSessionsForAuthID(existing.ID, "auth_removed")
+			s.ensureExecutorsForAuth(existing)
 		}
-	}
-	if _, err := s.coreManager.Update(ctx, existing); err != nil {
-		log.Errorf("failed to disable auth %s: %v", id, err)
-	}
-	if pendingDelete {
-		s.indexAuthMaintenanceAuth(existing)
-	} else {
-		s.removeAuthMaintenanceAuth(id)
-	}
-	if strings.EqualFold(strings.TrimSpace(existing.Provider), "codex") {
-		s.ensureExecutorsForAuth(existing)
 	}
 }
 
@@ -691,855 +367,7 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 		return
 	}
 	maxInterval := time.Duration(cfg.MaxRetryInterval) * time.Second
-	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials, cfg.MaxInvalidRequestRetries)
-}
-
-func (s *Service) startAuthMaintenance(parent context.Context) {
-	if s == nil || s.maintenanceCancel != nil {
-		return
-	}
-	s.installAuthMaintenanceHook()
-	s.ensureAuthMaintenanceQueue()
-	if parent == nil {
-		parent = context.Background()
-	}
-	ctx, cancel := context.WithCancel(parent)
-	s.maintenanceCancel = cancel
-	go s.runAuthMaintenance(ctx)
-}
-
-func (s *Service) runAuthMaintenance(ctx context.Context) {
-	wake := s.authMaintenanceWakeChan()
-	nextScan := time.Time{}
-	nextDelete := time.Time{}
-	lastDelete := time.Time{}
-	var timer *time.Timer
-
-	stopTimer := func() {
-		if timer == nil {
-			return
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer = nil
-	}
-	defer stopTimer()
-
-	clearQueue := func() {
-		s.resetAuthMaintenanceQueue()
-		nextDelete = time.Time{}
-	}
-
-	for {
-		now := time.Now()
-		cfg, authDir := s.snapshotAuthMaintenanceConfig()
-		if !cfg.Enable {
-			clearQueue()
-			nextScan = now.Add(time.Duration(cfg.ScanIntervalSeconds) * time.Second)
-		} else {
-			if nextScan.IsZero() || !now.Before(nextScan) {
-				candidates := s.scanAuthMaintenanceCandidates(now, cfg, authDir)
-				enqueued := 0
-				for _, candidate := range candidates {
-					if s.enqueueAuthMaintenanceCandidate(candidate) {
-						enqueued++
-					}
-				}
-				if enqueued > 0 {
-					log.Infof("auth maintenance queued %d auth file(s)", enqueued)
-				}
-				nextScan = now.Add(time.Duration(cfg.ScanIntervalSeconds) * time.Second)
-			}
-
-			if depth := s.authMaintenanceOutstandingLen(); depth > 0 {
-				spacing := authMaintenanceDeleteSpacing(cfg, depth)
-				if nextDelete.IsZero() {
-					nextDelete = now
-					minNextDelete := lastDelete.Add(spacing)
-					if !lastDelete.IsZero() && now.Before(minNextDelete) {
-						nextDelete = minNextDelete
-					}
-				}
-				if !nextDelete.IsZero() && !now.Before(nextDelete) {
-					candidate, remaining, ok := s.popAuthMaintenanceCandidate()
-					if ok {
-						err := s.deleteAuthMaintenanceCandidate(ctx, candidate)
-						s.finishAuthMaintenanceCandidate(candidate)
-						if err != nil {
-							log.WithError(err).Warnf("auth maintenance delete failed for %s", candidate.Path)
-							if ctx.Err() == nil {
-								s.enqueueAuthMaintenanceCandidate(candidate)
-							}
-						} else {
-							log.Infof("auth maintenance deleted %s (%s)", candidate.Path, candidate.Reason)
-						}
-						lastDelete = time.Now()
-						if outstanding := remaining + s.authMaintenanceInFlightLen(); outstanding > 0 {
-							nextDelete = lastDelete.Add(authMaintenanceDeleteSpacing(cfg, outstanding))
-						} else {
-							nextDelete = time.Time{}
-						}
-						continue
-					}
-					nextDelete = time.Time{}
-				}
-			} else {
-				nextDelete = time.Time{}
-			}
-		}
-
-		waitUntil := nextScan
-		if !nextDelete.IsZero() && (waitUntil.IsZero() || nextDelete.Before(waitUntil)) {
-			waitUntil = nextDelete
-		}
-		if waitUntil.IsZero() {
-			waitUntil = now.Add(time.Duration(cfg.ScanIntervalSeconds) * time.Second)
-		}
-		wait := time.Until(waitUntil)
-		if wait < 0 {
-			wait = 0
-		}
-		if timer == nil {
-			timer = time.NewTimer(wait)
-		} else {
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(wait)
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-wake:
-		case <-timer.C:
-		}
-	}
-}
-
-func authMaintenanceDeleteSpacing(cfg config.AuthMaintenanceConfig, backlog int) time.Duration {
-	interval := time.Duration(cfg.DeleteIntervalSeconds) * time.Second
-	if interval <= 0 {
-		interval = time.Duration(defaultMaintenanceDeleteIntervalSeconds) * time.Second
-	}
-	divisor := 1
-	switch {
-	case backlog >= 64:
-		divisor = 4
-	case backlog >= 16:
-		divisor = 2
-	}
-	spacing := interval / time.Duration(divisor)
-	if spacing < authMaintenanceDeleteMinSpacing {
-		return authMaintenanceDeleteMinSpacing
-	}
-	return spacing
-}
-
-func (s *Service) installAuthMaintenanceHook() {
-	if s == nil || s.coreManager == nil {
-		return
-	}
-	s.maintenanceHookOnce.Do(func() {
-		next := s.coreManager.Hook()
-		s.coreManager.SetHook(authMaintenanceHook{
-			next:    next,
-			service: s,
-		})
-	})
-}
-
-func (s *Service) ensureAuthMaintenanceQueue() {
-	if s == nil {
-		return
-	}
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	if s.maintenancePending == nil {
-		s.maintenancePending = make(map[string]struct{})
-	}
-	if s.maintenanceInFlight == nil {
-		s.maintenanceInFlight = make(map[string]struct{})
-	}
-	if s.maintenanceAuthIDsByPath == nil {
-		s.maintenanceAuthIDsByPath = make(map[string]map[string]struct{})
-	}
-	if s.maintenanceAuthPathByID == nil {
-		s.maintenanceAuthPathByID = make(map[string]string)
-	}
-	if s.maintenanceWake == nil {
-		s.maintenanceWake = make(chan struct{}, 1)
-	}
-}
-
-func (s *Service) authMaintenanceWakeChan() <-chan struct{} {
-	if s == nil {
-		return nil
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	return s.maintenanceWake
-}
-
-func (s *Service) enqueueAuthMaintenanceCandidate(candidate authMaintenanceCandidate) bool {
-	if s == nil {
-		return false
-	}
-	candidate.Key = strings.TrimSpace(candidate.Key)
-	candidate.Path = strings.TrimSpace(candidate.Path)
-	candidate.Reason = strings.TrimSpace(candidate.Reason)
-	if candidate.Key == "" || candidate.Path == "" || candidate.Reason == "" || len(candidate.IDs) == 0 {
-		return false
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	if _, ok := s.maintenancePending[candidate.Key]; ok {
-		s.maintenanceMu.Unlock()
-		return false
-	}
-	if _, ok := s.maintenanceInFlight[candidate.Key]; ok {
-		s.maintenanceMu.Unlock()
-		return false
-	}
-	s.maintenancePending[candidate.Key] = struct{}{}
-	s.maintenanceQueue = append(s.maintenanceQueue, candidate)
-	wake := s.maintenanceWake
-	s.maintenanceMu.Unlock()
-	if wake != nil {
-		select {
-		case wake <- struct{}{}:
-		default:
-		}
-	}
-	return true
-}
-
-func (s *Service) authMaintenanceQueueLen() int {
-	if s == nil {
-		return 0
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	return len(s.maintenanceQueue)
-}
-
-func (s *Service) popAuthMaintenanceCandidate() (authMaintenanceCandidate, int, bool) {
-	if s == nil {
-		return authMaintenanceCandidate{}, 0, false
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	if len(s.maintenanceQueue) == 0 {
-		return authMaintenanceCandidate{}, 0, false
-	}
-	candidate := s.maintenanceQueue[0]
-	s.maintenanceQueue = s.maintenanceQueue[1:]
-	delete(s.maintenancePending, candidate.Key)
-	s.maintenanceInFlight[candidate.Key] = struct{}{}
-	return candidate, len(s.maintenanceQueue), true
-}
-
-func (s *Service) resetAuthMaintenanceQueue() {
-	if s == nil {
-		return
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	s.maintenanceQueue = s.maintenanceQueue[:0]
-	clear(s.maintenancePending)
-	clear(s.maintenanceInFlight)
-	clear(s.maintenanceAuthIDsByPath)
-	clear(s.maintenanceAuthPathByID)
-}
-
-func (s *Service) finishAuthMaintenanceCandidate(candidate authMaintenanceCandidate) {
-	if s == nil {
-		return
-	}
-	key := strings.TrimSpace(candidate.Key)
-	if key == "" {
-		return
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	delete(s.maintenanceInFlight, key)
-	s.maintenanceMu.Unlock()
-}
-
-func (s *Service) authMaintenanceOutstandingLen() int {
-	if s == nil {
-		return 0
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	return len(s.maintenanceQueue) + len(s.maintenanceInFlight)
-}
-
-func (s *Service) authMaintenanceInFlightLen() int {
-	if s == nil {
-		return 0
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	return len(s.maintenanceInFlight)
-}
-
-func (s *Service) authMaintenanceIsTracked(key string) bool {
-	if s == nil {
-		return false
-	}
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return false
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	if _, ok := s.maintenancePending[key]; ok {
-		return true
-	}
-	_, ok := s.maintenanceInFlight[key]
-	return ok
-}
-
-func (s *Service) rebuildAuthMaintenanceIndex(snapshot []*coreauth.Auth, authDir string) {
-	if s == nil {
-		return
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	s.rebuildAuthMaintenanceIndexLocked(snapshot, authDir)
-}
-
-func (s *Service) rebuildAuthMaintenanceIndexLocked(snapshot []*coreauth.Auth, authDir string) {
-	idsByPath := make(map[string]map[string]struct{})
-	pathByID := make(map[string]string)
-	for _, auth := range snapshot {
-		if auth == nil {
-			continue
-		}
-		id := strings.TrimSpace(auth.ID)
-		if id == "" {
-			continue
-		}
-		path := resolveAuthFilePath(auth, authDir)
-		if path == "" {
-			continue
-		}
-		if idsByPath[path] == nil {
-			idsByPath[path] = make(map[string]struct{})
-		}
-		idsByPath[path][id] = struct{}{}
-		pathByID[id] = path
-	}
-	s.replaceAuthMaintenanceIndexLocked(idsByPath, pathByID)
-}
-
-func (s *Service) indexAuthMaintenanceAuth(auth *coreauth.Auth) {
-	if s == nil {
-		return
-	}
-	_, authDir := s.snapshotAuthMaintenanceConfig()
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	s.indexAuthMaintenanceAuthLocked(auth, authDir)
-}
-
-func (s *Service) indexAuthMaintenanceAuthLocked(auth *coreauth.Auth, authDir string) {
-	if auth == nil {
-		return
-	}
-	id := strings.TrimSpace(auth.ID)
-	if id == "" {
-		return
-	}
-	s.removeAuthMaintenanceAuthLocked(id)
-	path := resolveAuthFilePath(auth, authDir)
-	if path == "" {
-		return
-	}
-	if s.maintenanceAuthIDsByPath == nil {
-		s.maintenanceAuthIDsByPath = make(map[string]map[string]struct{})
-	}
-	if s.maintenanceAuthPathByID == nil {
-		s.maintenanceAuthPathByID = make(map[string]string)
-	}
-	if s.maintenanceAuthIDsByPath[path] == nil {
-		s.maintenanceAuthIDsByPath[path] = make(map[string]struct{})
-	}
-	s.maintenanceAuthIDsByPath[path][id] = struct{}{}
-	s.maintenanceAuthPathByID[id] = path
-}
-
-func (s *Service) removeAuthMaintenanceAuth(id string) {
-	if s == nil {
-		return
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	s.removeAuthMaintenanceAuthLocked(id)
-}
-
-func (s *Service) removeAuthMaintenanceAuthLocked(id string) {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return
-	}
-	path := strings.TrimSpace(s.maintenanceAuthPathByID[id])
-	if path == "" {
-		return
-	}
-	delete(s.maintenanceAuthPathByID, id)
-	if ids := s.maintenanceAuthIDsByPath[path]; ids != nil {
-		delete(ids, id)
-		if len(ids) == 0 {
-			delete(s.maintenanceAuthIDsByPath, path)
-		}
-	}
-}
-
-func (s *Service) authMaintenanceIDsForPath(path, authDir string) []string {
-	if s == nil {
-		return nil
-	}
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	if ids := s.maintenanceAuthIDsByPath[path]; len(ids) > 0 {
-		out := make([]string, 0, len(ids))
-		for id := range ids {
-			if trimmed := strings.TrimSpace(id); trimmed != "" {
-				out = append(out, trimmed)
-			}
-		}
-		s.maintenanceMu.Unlock()
-		return out
-	}
-	s.maintenanceMu.Unlock()
-
-	if s.coreManager == nil {
-		return nil
-	}
-	snapshot := s.coreManager.List()
-	s.rebuildAuthMaintenanceIndex(snapshot, authDir)
-
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	ids := s.maintenanceAuthIDsByPath[path]
-	out := make([]string, 0, len(ids))
-	for id := range ids {
-		if trimmed := strings.TrimSpace(id); trimmed != "" {
-			out = append(out, trimmed)
-		}
-	}
-	return out
-}
-
-func (s *Service) replaceAuthMaintenanceIndex(idsByPath map[string]map[string]struct{}, pathByID map[string]string) {
-	if s == nil {
-		return
-	}
-	s.ensureAuthMaintenanceQueue()
-	s.maintenanceMu.Lock()
-	defer s.maintenanceMu.Unlock()
-	s.replaceAuthMaintenanceIndexLocked(idsByPath, pathByID)
-}
-
-func (s *Service) replaceAuthMaintenanceIndexLocked(idsByPath map[string]map[string]struct{}, pathByID map[string]string) {
-	if idsByPath == nil {
-		idsByPath = make(map[string]map[string]struct{})
-	}
-	if pathByID == nil {
-		pathByID = make(map[string]string)
-	}
-	s.maintenanceAuthIDsByPath = idsByPath
-	s.maintenanceAuthPathByID = pathByID
-}
-
-func (s *Service) snapshotAuthMaintenanceConfig() (config.AuthMaintenanceConfig, string) {
-	if s == nil {
-		return config.AuthMaintenanceConfig{
-			ScanIntervalSeconds:   defaultMaintenanceScanIntervalSeconds,
-			DeleteIntervalSeconds: defaultMaintenanceDeleteIntervalSeconds,
-			QuotaStrikeThreshold:  defaultMaintenanceQuotaStrikeThreshold,
-		}, ""
-	}
-	s.cfgMu.RLock()
-	cfg := s.cfg
-	s.cfgMu.RUnlock()
-	if cfg == nil {
-		return config.AuthMaintenanceConfig{
-			ScanIntervalSeconds:   defaultMaintenanceScanIntervalSeconds,
-			DeleteIntervalSeconds: defaultMaintenanceDeleteIntervalSeconds,
-			QuotaStrikeThreshold:  defaultMaintenanceQuotaStrikeThreshold,
-		}, ""
-	}
-	maintenance := cfg.AuthMaintenance
-	if maintenance.ScanIntervalSeconds <= 0 {
-		maintenance.ScanIntervalSeconds = defaultMaintenanceScanIntervalSeconds
-	}
-	if maintenance.DeleteIntervalSeconds <= 0 {
-		maintenance.DeleteIntervalSeconds = defaultMaintenanceDeleteIntervalSeconds
-	}
-	if maintenance.QuotaStrikeThreshold <= 0 {
-		maintenance.QuotaStrikeThreshold = defaultMaintenanceQuotaStrikeThreshold
-	}
-	return maintenance, strings.TrimSpace(cfg.AuthDir)
-}
-
-func (s *Service) scanAuthMaintenanceCandidates(now time.Time, cfg config.AuthMaintenanceConfig, authDir string) []authMaintenanceCandidate {
-	if s == nil || s.coreManager == nil || !cfg.Enable {
-		return nil
-	}
-	snapshot := s.coreManager.List()
-	grouped := make(map[string]authMaintenanceCandidate)
-	idsByPath := make(map[string]map[string]struct{})
-	pathByID := make(map[string]string)
-	for _, auth := range snapshot {
-		path := resolveAuthFilePath(auth, authDir)
-		if path == "" {
-			continue
-		}
-		group := grouped[path]
-		if group.Key == "" {
-			group = authMaintenanceCandidate{
-				Key:  path,
-				Path: path,
-			}
-		}
-		if auth != nil && strings.TrimSpace(auth.ID) != "" {
-			id := strings.TrimSpace(auth.ID)
-			if idsByPath[path] == nil {
-				idsByPath[path] = make(map[string]struct{})
-			}
-			if _, exists := idsByPath[path][id]; !exists {
-				idsByPath[path][id] = struct{}{}
-				group.IDs = append(group.IDs, id)
-			}
-			pathByID[id] = path
-		}
-		if group.Reason == "" {
-			if reason, ok := authEligibleForMaintenanceDelete(auth, nil, cfg, now); ok {
-				group.Reason = reason
-			}
-		}
-		grouped[path] = group
-	}
-	s.replaceAuthMaintenanceIndex(idsByPath, pathByID)
-
-	candidates := make([]authMaintenanceCandidate, 0, len(grouped))
-	for _, candidate := range grouped {
-		if candidate.Reason == "" || len(candidate.IDs) == 0 {
-			continue
-		}
-		candidates = append(candidates, candidate)
-	}
-	return candidates
-}
-
-func (s *Service) handleAuthMaintenanceResult(_ context.Context, result coreauth.Result) {
-	if s == nil || s.coreManager == nil || result.Success {
-		return
-	}
-	cfg, authDir := s.snapshotAuthMaintenanceConfig()
-	if !cfg.Enable {
-		return
-	}
-	authID := strings.TrimSpace(result.AuthID)
-	if authID == "" {
-		return
-	}
-	auth, ok := s.coreManager.GetByID(authID)
-	if !ok || auth == nil {
-		return
-	}
-	reason, ok := authEligibleForMaintenanceDelete(auth, &result, cfg, time.Now())
-	if !ok {
-		return
-	}
-	candidate, ok := s.authMaintenanceCandidateForAuth(auth, authDir, reason)
-	if !ok {
-		return
-	}
-	if authMaintenancePendingDelete(auth) && s.authMaintenanceIsTracked(candidate.Key) {
-		return
-	}
-	s.disableAuthMaintenanceCandidate(context.Background(), candidate, authID)
-	if s.enqueueAuthMaintenanceCandidate(candidate) {
-		log.Debugf("auth maintenance queued %s (%s)", candidate.Path, candidate.Reason)
-	}
-}
-
-func (s *Service) authMaintenanceCandidateForAuth(auth *coreauth.Auth, authDir string, reason string) (authMaintenanceCandidate, bool) {
-	if s == nil || s.coreManager == nil || auth == nil {
-		return authMaintenanceCandidate{}, false
-	}
-	path := resolveAuthFilePath(auth, authDir)
-	if path == "" {
-		return authMaintenanceCandidate{}, false
-	}
-	candidate := authMaintenanceCandidate{
-		Key:    path,
-		Path:   path,
-		Reason: strings.TrimSpace(reason),
-	}
-	candidate.IDs = append(candidate.IDs, s.authMaintenanceIDsForPath(path, authDir)...)
-	if len(candidate.IDs) == 0 {
-		id := strings.TrimSpace(auth.ID)
-		if id == "" {
-			return authMaintenanceCandidate{}, false
-		}
-		candidate.IDs = []string{id}
-	}
-	if candidate.Reason == "" {
-		candidate.Reason = "maintenance_pending"
-	}
-	return candidate, true
-}
-
-func (s *Service) disableAuthMaintenanceCandidate(ctx context.Context, candidate authMaintenanceCandidate, persistID string) {
-	if s == nil {
-		return
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	persistID = strings.TrimSpace(persistID)
-	persisted := false
-	for _, id := range candidate.IDs {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
-		}
-		updateCtx := ctx
-		if persisted || (persistID != "" && id != persistID) {
-			updateCtx = coreauth.WithSkipPersist(updateCtx)
-		} else {
-			persisted = true
-		}
-		s.applyCoreAuthRemovalWithReason(updateCtx, id, candidate.Reason, true)
-	}
-}
-
-func authEligibleForMaintenanceDelete(auth *coreauth.Auth, result *coreauth.Result, cfg config.AuthMaintenanceConfig, _ time.Time) (string, bool) {
-	if reason, ok := authMaintenancePendingDeleteReason(auth); ok {
-		return reason, true
-	}
-	if auth == nil || auth.Disabled || auth.Status == coreauth.StatusDisabled {
-		return "", false
-	}
-	if statusCode := authMaintenanceStatusCode(auth, result); containsStatusCode(cfg.DeleteStatusCodes, statusCode) {
-		return fmt.Sprintf("http_%d", statusCode), true
-	}
-	if cfg.DeleteQuotaExceeded && auth.Quota.Exceeded && auth.Quota.StrikeCount >= cfg.QuotaStrikeThreshold {
-		return fmt.Sprintf("quota_strikes_%d", auth.Quota.StrikeCount), true
-	}
-	return "", false
-}
-
-func authMaintenanceStatusCode(auth *coreauth.Auth, result *coreauth.Result) int {
-	if statusCode := authMaintenanceStatusCodeFromResult(result); statusCode > 0 {
-		return statusCode
-	}
-	if auth == nil {
-		return 0
-	}
-	if auth.LastError != nil && auth.LastError.HTTPStatus > 0 {
-		return auth.LastError.HTTPStatus
-	}
-	switch strings.ToLower(strings.TrimSpace(auth.StatusMessage)) {
-	case "unauthorized":
-		return 401
-	case "payment_required":
-		return 402
-	case "not_found":
-		return 404
-	case "quota exhausted":
-		return 429
-	default:
-		return authMaintenanceStatusCodeFromMessage(auth.StatusMessage)
-	}
-}
-
-func authMaintenanceStatusCodeFromResult(result *coreauth.Result) int {
-	if result == nil || result.Error == nil {
-		return 0
-	}
-	if result.Error.HTTPStatus > 0 {
-		return result.Error.HTTPStatus
-	}
-	return authMaintenanceStatusCodeFromMessage(result.Error.Message)
-}
-
-func authMaintenanceStatusCodeFromMessage(message string) int {
-	message = strings.TrimSpace(message)
-	if message == "" {
-		return 0
-	}
-	if statusCode := int(gjson.Get(message, "status").Int()); statusCode > 0 {
-		return statusCode
-	}
-	if strings.EqualFold(strings.TrimSpace(gjson.Get(message, "error.type").String()), "usage_limit_reached") {
-		return 429
-	}
-	switch strings.ToLower(strings.TrimSpace(gjson.Get(message, "error.code").String())) {
-	case "token_invalidated", "token_revoked":
-		return 401
-	default:
-		return 0
-	}
-}
-
-func containsStatusCode(codes []int, want int) bool {
-	if want == 0 {
-		return false
-	}
-	for _, code := range codes {
-		if code == want {
-			return true
-		}
-	}
-	return false
-}
-
-func resolveAuthFilePath(auth *coreauth.Auth, authDir string) string {
-	if auth == nil {
-		return ""
-	}
-	if (auth.Disabled || auth.Status == coreauth.StatusDisabled) && !authMaintenancePendingDelete(auth) {
-		return ""
-	}
-	if auth.Attributes != nil && strings.EqualFold(strings.TrimSpace(auth.Attributes["runtime_only"]), "true") {
-		return ""
-	}
-	path := ""
-	if auth.Attributes != nil {
-		path = strings.TrimSpace(auth.Attributes["path"])
-	}
-	if path == "" {
-		path = strings.TrimSpace(auth.FileName)
-	}
-	if path == "" {
-		return ""
-	}
-	if !filepath.IsAbs(path) {
-		if authDir == "" {
-			return ""
-		}
-		path = filepath.Join(authDir, filepath.Base(path))
-	}
-	if abs, err := filepath.Abs(path); err == nil {
-		path = abs
-	}
-	return path
-}
-
-func (s *Service) deleteAuthMaintenanceCandidate(ctx context.Context, candidate authMaintenanceCandidate) error {
-	if s == nil {
-		return nil
-	}
-	ctx = coreauth.WithSkipPersist(ctx)
-	path := strings.TrimSpace(candidate.Path)
-	var cleanupErr error
-	if path != "" {
-		if s.watcher != nil {
-			s.watcher.SuppressAuthPath(path, authMaintenanceDeleteSuppressWindow)
-		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove auth file: %w", err)
-		}
-		if err := s.deleteAuthTokenRecord(ctx, path); err != nil {
-			cleanupErr = fmt.Errorf("delete auth token record: %w", err)
-		}
-	}
-	if cleanupErr == nil {
-		for _, id := range candidate.IDs {
-			s.clearAuthMaintenancePendingDelete(ctx, id)
-		}
-	}
-	for _, id := range candidate.IDs {
-		if trimmed := strings.TrimSpace(id); trimmed != "" {
-			s.emitAuthUpdate(ctx, watcher.AuthUpdate{Action: watcher.AuthUpdateActionDelete, ID: trimmed})
-		}
-	}
-	return cleanupErr
-}
-
-func (s *Service) deleteAuthTokenRecord(ctx context.Context, path string) error {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil
-	}
-	store := sdkAuth.GetTokenStore()
-	if store == nil {
-		return fmt.Errorf("token store unavailable")
-	}
-	s.cfgMu.RLock()
-	cfg := s.cfg
-	s.cfgMu.RUnlock()
-	if cfg != nil {
-		if dirSetter, ok := store.(interface{ SetBaseDir(string) }); ok {
-			dirSetter.SetBaseDir(cfg.AuthDir)
-		}
-	}
-	return store.Delete(ctx, path)
-}
-
-func (s *Service) clearAuthMaintenancePendingDelete(ctx context.Context, id string) {
-	s.applyCoreAuthRemovalWithReason(coreauth.WithSkipPersist(ctx), id, "", false)
-}
-
-func authMaintenancePendingDelete(auth *coreauth.Auth) bool {
-	if auth == nil || auth.Metadata == nil {
-		return false
-	}
-	raw, ok := auth.Metadata[authMaintenancePendingDeleteMetadataKey]
-	if !ok {
-		return false
-	}
-	switch value := raw.(type) {
-	case bool:
-		return value
-	case string:
-		return strings.EqualFold(strings.TrimSpace(value), "true")
-	default:
-		return false
-	}
-}
-
-func authMaintenancePendingDeleteReason(auth *coreauth.Auth) (string, bool) {
-	if !authMaintenancePendingDelete(auth) {
-		return "", false
-	}
-	if auth == nil || auth.Metadata == nil {
-		return "maintenance_pending", true
-	}
-	if reason, ok := auth.Metadata[authMaintenanceDeleteReasonMetadataKey].(string); ok {
-		reason = strings.TrimSpace(reason)
-		if reason != "" {
-			return reason, true
-		}
-	}
-	return "maintenance_pending", true
+	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials)
 }
 
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
@@ -1585,7 +413,7 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 	}
 	// Skip disabled auth entries when (re)binding executors.
 	// Disabled auths can linger during config reloads (e.g., removed OpenAI-compat entries)
-	// and must not override active provider executors (such as iFlow OAuth accounts).
+	// and must not override active provider executors.
 	if a.Disabled {
 		return
 	}
@@ -1615,12 +443,10 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
-	case "qwen":
-		s.coreManager.RegisterExecutor(executor.NewQwenExecutor(s.cfg))
-	case "iflow":
-		s.coreManager.RegisterExecutor(executor.NewIFlowExecutor(s.cfg))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
+	case "xai":
+		s.coreManager.RegisterExecutor(executor.NewXAIExecutor(s.cfg))
 	default:
 		providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
 		if providerKey == "" {
@@ -1659,6 +485,273 @@ func (s *Service) rebindExecutors() {
 	}
 }
 
+func (s *Service) applyConfigUpdate(newCfg *config.Config) {
+	if s == nil {
+		return
+	}
+
+	s.configUpdateMu.Lock()
+	defer s.configUpdateMu.Unlock()
+
+	previousStrategy := ""
+	var previousSessionAffinity bool
+	var previousSessionAffinityTTL string
+	s.cfgMu.RLock()
+	if s.cfg != nil {
+		previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+		previousSessionAffinity = s.cfg.Routing.SessionAffinity
+		previousSessionAffinityTTL = s.cfg.Routing.SessionAffinityTTL
+	}
+	s.cfgMu.RUnlock()
+
+	if newCfg == nil {
+		s.cfgMu.RLock()
+		newCfg = s.cfg
+		s.cfgMu.RUnlock()
+	}
+	if newCfg == nil {
+		return
+	}
+
+	nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
+	normalizeStrategy := func(strategy string) string {
+		switch strategy {
+		case "fill-first", "fillfirst", "ff":
+			return "fill-first"
+		default:
+			return "round-robin"
+		}
+	}
+	previousStrategy = normalizeStrategy(previousStrategy)
+	nextStrategy = normalizeStrategy(nextStrategy)
+
+	nextSessionAffinity := newCfg.Routing.SessionAffinity
+	nextSessionAffinityTTL := newCfg.Routing.SessionAffinityTTL
+
+	selectorChanged := previousStrategy != nextStrategy ||
+		previousSessionAffinity != nextSessionAffinity ||
+		previousSessionAffinityTTL != nextSessionAffinityTTL
+
+	if s.coreManager != nil && selectorChanged {
+		var selector coreauth.Selector
+		switch nextStrategy {
+		case "fill-first":
+			selector = &coreauth.FillFirstSelector{}
+		default:
+			selector = &coreauth.RoundRobinSelector{}
+		}
+
+		if nextSessionAffinity {
+			ttl := time.Hour
+			if ttlStr := strings.TrimSpace(nextSessionAffinityTTL); ttlStr != "" {
+				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
+					ttl = parsed
+				}
+			}
+			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
+				Fallback: selector,
+				TTL:      ttl,
+			})
+		}
+
+		s.coreManager.SetSelector(selector)
+	}
+
+	s.applyRetryConfig(newCfg)
+	s.applyPprofConfig(newCfg)
+	if s.server != nil {
+		s.server.UpdateClients(newCfg)
+	}
+	s.cfgMu.Lock()
+	s.cfg = newCfg
+	s.cfgMu.Unlock()
+	if s.coreManager != nil {
+		s.coreManager.SetConfig(newCfg)
+		s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
+	}
+	if newCfg.Home.Enabled {
+		s.registerHomeExecutors()
+	}
+	s.rebindExecutors()
+}
+
+func forceHomeRuntimeConfig(cfg *config.Config) {
+	if cfg == nil {
+		return
+	}
+	cfg.APIKeys = nil
+	cfg.UsageStatisticsEnabled = true
+	cfg.DisableCooling = true
+	cfg.WebsocketAuth = false
+	cfg.EnableGeminiCLIEndpoint = false
+	cfg.RemoteManagement.AllowRemote = false
+	cfg.RemoteManagement.DisableControlPanel = true
+}
+
+func (s *Service) registerHomeExecutors() {
+	if s == nil || s.coreManager == nil || s.cfg == nil {
+		return
+	}
+
+	// Register baseline executors so home-dispatched auth entries can execute without
+	// requiring any local auth-dir credentials.
+	s.coreManager.RegisterExecutor(executor.NewCodexAutoExecutor(s.cfg))
+	s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
+	s.coreManager.RegisterExecutor(executor.NewGeminiExecutor(s.cfg))
+	s.coreManager.RegisterExecutor(executor.NewGeminiVertexExecutor(s.cfg))
+	s.coreManager.RegisterExecutor(executor.NewGeminiCLIExecutor(s.cfg))
+	s.coreManager.RegisterExecutor(executor.NewAIStudioExecutor(s.cfg, "", s.wsGateway))
+	s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
+	s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
+	s.coreManager.RegisterExecutor(executor.NewOpenAICompatExecutor("openai-compatibility", s.cfg))
+}
+
+func (s *Service) applyHomeOverlay(remoteCfg *config.Config) {
+	if s == nil || remoteCfg == nil {
+		return
+	}
+
+	s.cfgMu.RLock()
+	baseCfg := s.cfg
+	s.cfgMu.RUnlock()
+	if baseCfg == nil {
+		return
+	}
+
+	merged := *remoteCfg
+	merged.Host = baseCfg.Host
+	merged.Port = baseCfg.Port
+	merged.TLS = baseCfg.TLS
+	merged.Home = baseCfg.Home
+	forceHomeRuntimeConfig(&merged)
+
+	logHomeConfigChanges(baseCfg, &merged)
+	s.applyConfigUpdate(&merged)
+}
+
+func logHomeConfigChanges(oldCfg, newCfg *config.Config) {
+	if oldCfg == nil || newCfg == nil || !newCfg.Home.Enabled || (!oldCfg.Debug && !newCfg.Debug) {
+		return
+	}
+
+	details := diff.BuildConfigChangeDetails(oldCfg, newCfg)
+	if len(details) == 0 {
+		return
+	}
+
+	if newCfg.Debug && !log.IsLevelEnabled(log.DebugLevel) {
+		util.SetLogLevel(newCfg)
+	}
+
+	log.Debugf("home config changes detected:")
+	for _, detail := range details {
+		log.Debugf("  %s", detail)
+	}
+}
+
+func (s *Service) startHomeUsageForwarder(ctx context.Context, client *home.Client) {
+	if s == nil || client == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	sleep := func(d time.Duration) bool {
+		if d <= 0 {
+			return true
+		}
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			if !client.HeartbeatOK() {
+				if !sleep(time.Second) {
+					return
+				}
+				continue
+			}
+
+			items := redisqueue.PopOldest(64)
+			if len(items) == 0 {
+				if !sleep(500 * time.Millisecond) {
+					return
+				}
+				continue
+			}
+
+			for i := range items {
+				if errPush := client.LPushUsage(ctx, items[i]); errPush != nil {
+					for j := i; j < len(items); j++ {
+						redisqueue.Enqueue(items[j])
+					}
+					if !sleep(time.Second) {
+						return
+					}
+					break
+				}
+			}
+		}
+	}()
+}
+
+func (s *Service) startHomeSubscriber(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	s.cfgMu.RLock()
+	cfg := s.cfg
+	s.cfgMu.RUnlock()
+	if cfg == nil || !cfg.Home.Enabled {
+		return
+	}
+
+	if s.homeCancel != nil {
+		s.homeCancel()
+		s.homeCancel = nil
+	}
+	if s.homeClient != nil {
+		s.homeClient.Close()
+		s.homeClient = nil
+	}
+
+	homeCtx := ctx
+	if homeCtx == nil {
+		homeCtx = context.Background()
+	}
+	homeCtx, cancel := context.WithCancel(homeCtx)
+	s.homeCancel = cancel
+
+	client := home.New(cfg.Home)
+	s.homeClient = client
+	home.SetCurrent(client)
+
+	go client.StartConfigSubscriber(homeCtx, func(raw []byte) error {
+		parsed, err := config.ParseConfigBytes(raw)
+		if err != nil {
+			log.Warnf("failed to parse home config payload: %v", err)
+			return err
+		}
+		s.applyHomeOverlay(parsed)
+		return nil
+	})
+	s.startHomeUsageForwarder(homeCtx, client)
+}
+
 // Run starts the service and blocks until the context is cancelled or the server stops.
 // It initializes all components including authentication, file watching, HTTP server,
 // and starts processing requests. The method blocks until the context is cancelled.
@@ -1676,7 +769,12 @@ func (s *Service) Run(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
-	sdkusage.StartDefault(ctx)
+	usage.StartDefault(ctx)
+	homeEnabled := s.cfg != nil && s.cfg.Home.Enabled
+	if homeEnabled {
+		forceHomeRuntimeConfig(s.cfg)
+		redisqueue.SetUsageStatisticsEnabled(true)
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
@@ -1686,33 +784,36 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	}()
 
-	if err := s.ensureAuthDir(); err != nil {
-		return err
+	if !homeEnabled {
+		if errEnsureAuthDir := s.ensureAuthDir(); errEnsureAuthDir != nil {
+			return errEnsureAuthDir
+		}
 	}
-	s.restoreUsageStatistics()
 
 	s.applyRetryConfig(s.cfg)
 
-	if s.coreManager != nil {
+	if s.coreManager != nil && !homeEnabled {
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
 			log.Warnf("failed to load auth store: %v", errLoad)
 		}
 	}
 
-	tokenResult, err := s.tokenProvider.Load(ctx, s.cfg)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		return err
-	}
-	if tokenResult == nil {
-		tokenResult = &TokenClientResult{}
-	}
+	if !homeEnabled {
+		tokenResult, err := s.tokenProvider.Load(ctx, s.cfg)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+		if tokenResult == nil {
+			tokenResult = &TokenClientResult{}
+		}
 
-	apiKeyResult, err := s.apiKeyProvider.Load(ctx, s.cfg)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		return err
-	}
-	if apiKeyResult == nil {
-		apiKeyResult = &APIKeyClientResult{}
+		apiKeyResult, err := s.apiKeyProvider.Load(ctx, s.cfg)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+		if apiKeyResult == nil {
+			apiKeyResult = &APIKeyClientResult{}
+		}
 	}
 
 	// legacy clients removed; no caches to refresh
@@ -1722,6 +823,10 @@ func (s *Service) Run(ctx context.Context) error {
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()
+	}
+
+	if homeEnabled {
+		s.startHomeSubscriber(ctx)
 	}
 
 	s.ensureWebsocketGateway()
@@ -1743,6 +848,12 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 			log.Debugf("ws-auth disabled; existing websocket sessions remain connected")
 		})
+	}
+
+	if homeEnabled {
+		s.registerHomeExecutors()
+		// Home mode does not expose in-process Redis RESP usage output; usage is forwarded to home instead.
+		redisqueue.SetEnabled(true)
 	}
 
 	if s.hooks.OnBeforeStart != nil {
@@ -1805,99 +916,42 @@ func (s *Service) Run(ctx context.Context) error {
 		s.hooks.OnAfterStart(s)
 	}
 
-	var watcherWrapper *WatcherWrapper
-	reloadCallback := func(newCfg *config.Config) {
-		previousStrategy := ""
-		previousUsageEnabled := false
-		previousUsagePersistenceInterval := time.Duration(0)
-		s.cfgMu.RLock()
-		if s.cfg != nil {
-			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
-			previousUsageEnabled = s.cfg.UsageStatisticsEnabled
-			previousUsagePersistenceInterval = usagePersistenceIntervalForConfig(s.cfg)
-		}
-		s.cfgMu.RUnlock()
+	if !homeEnabled {
+		var watcherWrapper *WatcherWrapper
+		reloadCallback := func(newCfg *config.Config) { s.applyConfigUpdate(newCfg) }
 
-		if newCfg == nil {
-			s.cfgMu.RLock()
-			newCfg = s.cfg
-			s.cfgMu.RUnlock()
+		watcherWrapper, errCreate := s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
+		if errCreate != nil {
+			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
 		}
-		if newCfg == nil {
-			return
+		s.watcher = watcherWrapper
+		s.ensureAuthUpdateQueue(ctx)
+		if s.authUpdates != nil {
+			watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
 		}
+		watcherWrapper.SetConfig(s.cfg)
 
-		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
-		normalizeStrategy := func(strategy string) string {
-			switch strategy {
-			case "fill-first", "fillfirst", "ff":
-				return "fill-first"
-			default:
-				return "round-robin"
-			}
+		watcherCtx, watcherCancel := context.WithCancel(context.Background())
+		s.watcherCancel = watcherCancel
+		if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
+			return fmt.Errorf("cliproxy: failed to start watcher: %w", errStart)
 		}
-		previousStrategy = normalizeStrategy(previousStrategy)
-		nextStrategy = normalizeStrategy(nextStrategy)
-		if s.coreManager != nil && previousStrategy != nextStrategy {
-			var selector coreauth.Selector
-			switch nextStrategy {
-			case "fill-first":
-				selector = &coreauth.FillFirstSelector{}
-			default:
-				selector = &coreauth.RoundRobinSelector{}
-			}
-			s.coreManager.SetSelector(selector)
-		}
-
-		s.applyRetryConfig(newCfg)
-		s.applyPprofConfig(newCfg)
-		if s.server != nil {
-			s.server.UpdateClients(newCfg)
-		}
-		s.cfgMu.Lock()
-		s.cfg = newCfg
-		s.cfgMu.Unlock()
-		if s.coreManager != nil {
-			s.coreManager.SetConfig(newCfg)
-			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
-		}
-		s.applyUsagePersistenceConfigChange(previousUsageEnabled, previousUsagePersistenceInterval, newCfg)
-		s.rebindExecutors()
+		log.Info("file watcher started for config and auth directory changes")
 	}
-
-	watcherWrapper, err = s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
-	if err != nil {
-		return fmt.Errorf("cliproxy: failed to create watcher: %w", err)
-	}
-	s.watcher = watcherWrapper
-	s.ensureAuthUpdateQueue(ctx)
-	if s.authUpdates != nil {
-		watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
-	}
-	watcherWrapper.SetConfig(s.cfg)
-
-	watcherCtx, watcherCancel := context.WithCancel(context.Background())
-	s.watcherCancel = watcherCancel
-	if err = watcherWrapper.Start(watcherCtx); err != nil {
-		return fmt.Errorf("cliproxy: failed to start watcher: %w", err)
-	}
-	log.Info("file watcher started for config and auth directory changes")
 
 	// Prefer core auth manager auto refresh if available.
-	if s.coreManager != nil {
+	if s.coreManager != nil && !homeEnabled {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
-	s.startAuthMaintenance(context.Background())
-	s.startUsagePersistenceLoop()
 
 	select {
 	case <-ctx.Done():
 		log.Debug("service context cancelled, shutting down...")
 		return ctx.Err()
-	case err = <-s.serverErr:
-		return err
+	case errServer := <-s.serverErr:
+		return errServer
 	}
 }
 
@@ -1920,6 +974,16 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			ctx = context.Background()
 		}
 
+		if s.homeCancel != nil {
+			s.homeCancel()
+			s.homeCancel = nil
+		}
+		if s.homeClient != nil {
+			s.homeClient.Close()
+			s.homeClient = nil
+		}
+		home.ClearCurrent()
+
 		// legacy refresh loop removed; only stopping core auth manager below
 
 		if s.watcherCancel != nil {
@@ -1928,10 +992,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if s.coreManager != nil {
 			s.coreManager.StopAutoRefresh()
 		}
-		if s.maintenanceCancel != nil {
-			s.maintenanceCancel()
-		}
-		s.stopUsagePersistenceLoop()
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {
 				log.Errorf("failed to stop file watcher: %v", err)
@@ -1971,8 +1031,7 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
-		s.persistUsageStatistics("shutdown")
-		sdkusage.StopDefault()
+		usage.StopDefault()
 	})
 	return shutdownErr
 }
@@ -2108,14 +1167,11 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 		models = applyExcludedModels(models, excluded)
-	case "qwen":
-		models = registry.GetQwenModels()
-		models = applyExcludedModels(models, excluded)
-	case "iflow":
-		models = registry.GetIFlowModels()
-		models = applyExcludedModels(models, excluded)
 	case "kimi":
 		models = registry.GetKimiModels()
+		models = applyExcludedModels(models, excluded)
+	case "xai":
+		models = registry.GetXAIModels()
 		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
@@ -2158,6 +1214,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 			for i := range s.cfg.OpenAICompatibility {
 				compat := &s.cfg.OpenAICompatibility[i]
+				if compat.Disabled {
+					continue
+				}
 				if strings.EqualFold(compat.Name, compatName) {
 					isCompatAuth = true
 					// Convert compatibility models to registry models
@@ -2231,6 +1290,7 @@ func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 		s.ensureExecutorsForAuth(current)
 	}
 	s.registerModelsForAuth(current)
+	s.coreManager.ReconcileRegistryModelStates(context.Background(), current.ID)
 
 	latest, ok := s.latestAuthForModelRegistration(current.ID)
 	if !ok || latest.Disabled {
@@ -2244,6 +1304,7 @@ func (s *Service) refreshModelRegistrationForAuth(current *coreauth.Auth) bool {
 	// no auth fields changed, but keeps the refresh path simple and correct.
 	s.ensureExecutorsForAuth(latest)
 	s.registerModelsForAuth(latest)
+	s.coreManager.ReconcileRegistryModelStates(context.Background(), latest.ID)
 	s.coreManager.RefreshSchedulerEntry(current.ID)
 	return true
 }
@@ -2596,7 +1657,7 @@ func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
 	if entry == nil {
 		return nil
 	}
-	return buildConfigModels(entry.Models, "openai", "openai")
+	return registry.WithCodexBuiltins(buildConfigModels(entry.Models, "openai", "openai"))
 }
 
 func rewriteModelInfoName(name, oldID, newID string) string {

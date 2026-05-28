@@ -19,7 +19,7 @@ ARG BUILD_DATE=unknown
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
 
-FROM --platform=linux/${TARGETARCH} alpine:3.22.0
+FROM --platform=linux/${TARGETARCH} alpine:3.23
 
 RUN apk add --no-cache tzdata ca-certificates
 

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type refreshFailureTestExecutor struct {
@@ -55,7 +55,7 @@ func (e transientRefreshTestError) Error() string   { return e.msg }
 func (e transientRefreshTestError) StatusCode() int { return e.status }
 func (e transientRefreshTestError) Terminal() bool  { return false }
 
-func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.T) {
+func TestManagerRefreshAuth_MarksTerminalRefresh401Unauthorized(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, nil, nil)
 	manager.RegisterExecutor(refreshFailureTestExecutor{
@@ -95,18 +95,21 @@ func TestManagerRefreshAuth_PersistsTerminalRefresh401ForMaintenance(t *testing.
 	if !strings.Contains(updated.LastError.Message, "status 401") {
 		t.Fatalf("expected LastError.Message to preserve refresh failure details, got %q", updated.LastError.Message)
 	}
-	if updated.Status != StatusActive {
-		t.Fatalf("expected auth status to remain active, got %q", updated.Status)
+	if updated.Status != StatusError {
+		t.Fatalf("expected auth status to be error, got %q", updated.Status)
 	}
-	if updated.Unavailable {
-		t.Fatal("expected auth to remain schedulable until maintenance handles deletion")
+	if !updated.Unavailable {
+		t.Fatal("expected unauthorized auth to be unavailable")
 	}
-	if updated.NextRefreshAfter.IsZero() || !updated.NextRefreshAfter.After(started) {
-		t.Fatalf("expected NextRefreshAfter to be scheduled after refresh failure, got %v", updated.NextRefreshAfter)
+	if updated.StatusMessage != "unauthorized" {
+		t.Fatalf("expected status message unauthorized, got %q", updated.StatusMessage)
+	}
+	if !updated.NextRefreshAfter.IsZero() {
+		t.Fatalf("expected unauthorized refresh failure to clear NextRefreshAfter, got %v after %v", updated.NextRefreshAfter, started)
 	}
 }
 
-func TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance(t *testing.T) {
+func TestManagerRefreshAuth_RecordsTransientRefreshStatusAndBackoff(t *testing.T) {
 	ctx := context.Background()
 	manager := NewManager(nil, nil, nil)
 	manager.RegisterExecutor(refreshFailureTestExecutor{
@@ -130,6 +133,7 @@ func TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance(t *t
 		t.Fatalf("register auth: %v", err)
 	}
 
+	started := time.Now()
 	manager.refreshAuth(ctx, auth.ID)
 
 	updated, ok := manager.GetByID(auth.ID)
@@ -139,13 +143,54 @@ func TestManagerRefreshAuth_DoesNotMarkTransientRefreshStatusForMaintenance(t *t
 	if updated.LastError == nil {
 		t.Fatal("expected refresh failure to persist LastError")
 	}
-	if updated.LastError.HTTPStatus != 0 {
-		t.Fatalf("expected transient refresh error to avoid maintenance status code, got %d", updated.LastError.HTTPStatus)
+	if updated.LastError.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("expected transient refresh HTTPStatus = 429, got %d", updated.LastError.HTTPStatus)
 	}
 	if updated.Status != StatusActive {
 		t.Fatalf("expected auth status to remain active, got %q", updated.Status)
 	}
 	if updated.Unavailable {
 		t.Fatal("expected transient refresh failure to avoid blocking scheduler")
+	}
+	if updated.NextRefreshAfter.IsZero() || !updated.NextRefreshAfter.After(started) {
+		t.Fatalf("expected transient refresh failure to schedule NextRefreshAfter, got %v", updated.NextRefreshAfter)
+	}
+}
+
+func TestManagerRefreshAuth_BacksOffWhenRefreshIsIneffective(t *testing.T) {
+	ctx := context.Background()
+	manager := NewManager(nil, nil, nil)
+	manager.RegisterExecutor(refreshFailureTestExecutor{provider: "codex"})
+
+	auth := &Auth{
+		ID:       "refresh-ineffective",
+		Provider: "codex",
+		Status:   StatusActive,
+		Metadata: map[string]any{
+			"email":                    "user@example.com",
+			"refresh_token":            "refresh-token",
+			"expired":                  time.Now().Add(-5 * time.Minute).Format(time.RFC3339),
+			"refresh_interval_seconds": 60,
+		},
+	}
+	if _, err := manager.Register(ctx, auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	started := time.Now()
+	manager.refreshAuth(ctx, auth.ID)
+
+	updated, ok := manager.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth %q to remain registered", auth.ID)
+	}
+	if updated.NextRefreshAfter.IsZero() {
+		t.Fatal("expected ineffective refresh to schedule NextRefreshAfter backoff")
+	}
+	if !updated.NextRefreshAfter.After(started) {
+		t.Fatalf("expected NextRefreshAfter after %v, got %v", started, updated.NextRefreshAfter)
+	}
+	if updated.NextRefreshAfter.Sub(started) > refreshIneffectiveBackoff+5*time.Second {
+		t.Fatalf("expected ineffective refresh backoff near %v, got %v", refreshIneffectiveBackoff, updated.NextRefreshAfter.Sub(started))
 	}
 }

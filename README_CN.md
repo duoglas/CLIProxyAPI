@@ -1,75 +1,147 @@
-# CLIProxyAPI 认证与 Codex 优化版
+# CLIProxyAPI Fork
 
-[English](README.md) | 中文
+这是 [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI)
+的独立 fork。它保留 upstream 的 OpenAI/Gemini/Claude/Codex 兼容代理能力，但本
+README 只说明本 fork 做了什么、当前对齐到哪个 upstream 版本，以及如何验证/运行。
 
-本仓库是基于 `router-for-me/CLIProxyAPI` 修改而来的独立维护分支。
+完整的 upstream 产品文档请参考 upstream 仓库及其官方文档。本文件不再保留
+upstream 原 README 中的赞助、生态项目列表和营销型说明。
 
-它不是上游官方仓库，与 `router-for-me` 没有关联，不应被描述为上游的官方镜像、发布渠道、支持渠道或文档入口。
+## 当前对齐的 upstream 版本
 
-## 这个分支的定位
+- Upstream 仓库：`router-for-me/CLIProxyAPI`
+- 当前 upstream 基线：`upstream/main` 的 `66c5d60b`
+- 同步点 upstream tag：`v7.1.11`
+- 本 fork 同步提交：`8ccf8cf7 merge: sync upstream main`
+- 本 fork 同步 tag：`v0.1.9`
+- 同步日期：2026-05-19
 
-这个分支保留了原项目面向 CLI 代理兼容层的核心目标，但当前维护重点更偏向运行时行为调整，而不是商业推广内容。
+后续可能会有仅修改文档的提交位于该同步提交之后；这里描述的代码基线是
+`v0.1.9` 对齐 upstream `v7.1.11` 的结果。
 
-相对于 `router-for-me/CLIProxyAPI`，当前分支的主要改动集中在：
+## 这个 fork 主要解决什么
 
-- Codex / OpenAI Responses 请求翻译与执行器接线调整
-- 认证调度器在高并发下的调度与抖动控制优化
-- 异步认证持久化补充
-- 调度器基准测试与持久化测试更新
-- 容器默认镜像改为当前仓库自己的 GHCR 发布地址
+这个 fork 面向高并发 CLI proxy 场景：大量 OAuth/API-key 凭据被放入池中，并在
+流式响应、WebSocket、Redis usage reporting 等链路下持续轮转和重试。
 
-目前 `go.mod` 仍保留 `github.com/router-for-me/CLIProxyAPI/v6` 模块路径以兼容现有代码结构。这个兼容性安排不代表与上游存在项目关联。
+重点是：
 
-## 核心能力
+- 保留大账号池下低 churn 的 auth 调度；
+- 避免请求路径上做同步持久化写入；
+- 保持 WebSocket/session affinity 在重连和重试时稳定；
+- 保留并强化 Redis usage queue，避免突发流量导致无界内存增长；
+- 合并 upstream 功能更新时，针对本 fork 的高并发链路做适配，而不是盲目覆盖。
 
-- 面向 CLI 客户端的 OpenAI、Gemini、Claude、Codex 兼容 API
-- 支持 Codex、Claude Code、Qwen Code、iFlow 的 OAuth 接入
-- 支持流式与非流式响应
-- 支持多账户路由与负载均衡
-- 提供可复用的 Go SDK：`sdk/cliproxy`
-- 适合二次嵌入的请求翻译与 Provider 执行层
+## 本 fork 在同步 upstream 时保留的行为
 
-## 快速开始
+### Auth scheduler / conductor 热路径
 
-使用本分支的 GHCR 镜像：
+- 保留 model-aware auth scheduler 快路径。
+- Codex WebSocket 请求在合适场景下仍优先选择支持 WebSocket 的凭据。
+- 单模型状态更新尽量走轻量路径，避免大范围 scheduler rebuild。
+- Auth 持久化仍然是合并后的异步后台写入，避免阻塞请求路径。
+- 保留 stream bootstrap retry：当流式响应在首个有效 payload 前失败时，可以轮转
+  到下一个可用 auth，并返回更有意义的管理/API 错误。
+
+### Redis usage queue
+
+- 保留 Redis-compatible usage queue。
+- 队列按 item 数量和总 payload 字节数做上限，防止内存无界增长。
+- RESP 协议解析保留 array size、line length、bulk size、pop count、auth failure、
+  pre-auth/idle deadline 等限制。
+- 即使没有配置 remote management key，本地管理密码仍可用于本地 Redis AUTH。
+- `LPOP` 返回最早入队的数据，`RPOP` 返回最新入队的数据。
+- 保留 upstream Pub/Sub usage streaming，并和本 fork 的队列上限/协议硬化合并。
+
+### Protocol multiplexer
+
+- 每个 accepted connection 独立做协议 sniff，避免阻塞 listener accept loop。
+- TLS/HTTP/RESP 路由保留明确的 sniff deadline。
+- mux listener handoff 保持非阻塞，并处理关闭状态，避免 HTTP listener 饱和或关闭时
+  卡住上游连接。
+
+### OpenAI/Codex 兼容链路
+
+- OpenAI Responses WebSocket 的 pinned auth 逻辑会保留 quota/error status，并在可重试
+  的 upstream 失败时释放 pinned auth。
+- Codex non-stream 执行可以在收到 `response.completed` 后返回，不必等待 upstream
+  服务端关闭响应体。
+- route-model stream 执行可以用一个模型做 auth 选择，同时把用户原始请求模型发送给 executor。
+
+### Watcher / config reload
+
+- Config reload 保留本 fork 的低 churn 目标。
+- 对 auth/model 的变化尽量做定向更新和 stale state reconciliation，而不是全量重建。
+
+## `v0.1.9` 合并进来的 upstream 功能
+
+`v0.1.9` 同步了 upstream 到 `v7.1.11` 的功能性更新，包括：
+
+- Go module/API 进入 upstream v7 线；
+- Home control-plane/client 支持；
+- xAI/Grok auth 和 executor 支持；
+- Codex client model catalog；
+- OpenAI image/video handler 更新；
+- Antigravity executor、credits/balance 更新；
+- management API 和 auth-file 管理增强；
+- registry/catalog 刷新，包括 GPT-5.5 和 Codex client models；
+- translator/runtime helper 重构到 `internal/runtime/executor/helps`；
+- 移除 upstream 已删除的 qwen/iflow provider 路径；
+- upstream 新增 workflow 文件，并已使用具备 workflow scope 的 key 推送。
+
+## 这个 README 刻意删掉了什么
+
+原来的 upstream 风格 README 包含赞助商、生态项目列表、完整产品宣传和通用文档入口。
+这些内容已经从本 fork README 中移除。本 README 只回答三件事：
+
+1. 当前对齐的 upstream 版本是什么；
+2. 这个 fork 保留/修改了什么；
+3. 如何验证和运行。
+
+## 构建和验证
 
 ```bash
-docker run --rm -p 8317:8317 ghcr.io/arron196/cliproxyapi:latest
+gofmt -w .
+go build -o cli-proxy-api ./cmd/server
+go test ./...
 ```
 
-或者直接使用 Compose：
+`v0.1.9` upstream sync 已通过：
 
 ```bash
-docker compose up -d
+go build -o test-output ./cmd/server
+go test ./...
 ```
 
-`docker-compose.yml` 当前默认镜像为：
+同步时还检查了未解决冲突标记，以及 Go 代码中是否仍有旧的
+`github.com/router-for-me/CLIProxyAPI/v6` import。
 
-```text
-ghcr.io/arron196/cliproxyapi:latest
+## 运行
+
+```bash
+go run ./cmd/server --config config.yaml
 ```
 
-## 本地文档
+常用参数：
 
-- SDK 使用文档：[docs/sdk-usage_CN.md](docs/sdk-usage_CN.md)
-- SDK 高级主题：[docs/sdk-advanced_CN.md](docs/sdk-advanced_CN.md)
-- SDK 访问认证：[docs/sdk-access_CN.md](docs/sdk-access_CN.md)
-- SDK Watcher 集成：[docs/sdk-watcher_CN.md](docs/sdk-watcher_CN.md)
+- `--config <path>`：指定配置文件；
+- `--tui`：启动终端 UI；
+- `--standalone`：standalone 模式；
+- `--local-model`：禁用远程模型目录更新；
+- `--no-browser`：OAuth 流程不自动打开浏览器；
+- `--oauth-callback-port <port>`：指定 OAuth callback 端口。
 
-开启相关配置后，管理端点会暴露在 `/v0/management`。本分支当前不提供独立的外部文档站点。
+## 后续同步策略
 
-## 项目身份说明
+继续从 upstream 同步时，功能性更新应该合并；但如果影响本 fork 的高并发链路，需要
+结合本 fork 的实现做适配，而不是简单选择 upstream 或 local 版本。重点保护区域：
 
-- 上游基线：`router-for-me/CLIProxyAPI`
-- 当前仓库：独立维护的衍生分支
-- 与上游关系：无关联、无背书、无共享发布流程、无共享支持义务
+- `sdk/cliproxy/auth/*` scheduler/conductor/selector；
+- `internal/redisqueue` 和 `internal/api/redis_queue_protocol.go`；
+- `internal/api` 下的 protocol multiplexer；
+- Codex 和 OpenAI Responses WebSocket executor/handler；
+- config watcher 和定向 reload 逻辑。
 
-如果你需要上游默认行为或上游支持，请直接使用上游仓库。
+## License
 
-## 贡献
-
-欢迎围绕当前仓库的行为和文档提交修改，但请不要把上游仓库的发布承诺或商业集成视为本仓库的一部分。
-
-## 许可证
-
-MIT，见 [LICENSE](LICENSE)。
+本 fork 继续使用 upstream 的 MIT license。见 [LICENSE](LICENSE)。

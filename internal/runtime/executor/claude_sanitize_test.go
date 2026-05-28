@@ -116,34 +116,39 @@ func TestGenerateBillingHeader_StableAcrossTurns(t *testing.T) {
         ]
     }`)
 
-    h1 := generateBillingHeader(turn1, "2.1.63")
-    h2 := generateBillingHeader(turn2, "2.1.63")
+    // With experimentalCCHSigning=true, cch is fixed to "00000" so the billing
+    // header is byte-identical across turns of the same conversation. This is the
+    // mode applyCloaking selects for OAuth tokens, which protects thinking-signature
+    // validation on replay.
+    msgText := "you are helpful"
+    h1 := generateBillingHeader(turn1, true, "2.1.63", msgText, "cli", "")
+    h2 := generateBillingHeader(turn2, true, "2.1.63", msgText, "cli", "")
     if h1 != h2 {
         t.Fatalf("billing header drifted between turns:\n t1=%s\n t2=%s", h1, h2)
     }
     if !strings.Contains(h1, "cc_version=2.1.63.") {
         t.Fatalf("unexpected billing header format: %s", h1)
     }
-    if !strings.Contains(h1, "cch=") {
-        t.Fatalf("billing header missing cch: %s", h1)
+    if !strings.Contains(h1, "cch=00000;") {
+        t.Fatalf("billing header missing fixed cch under signing mode: %s", h1)
     }
 }
 
 func TestGenerateBillingHeader_ChangesWhenSystemChanges(t *testing.T) {
-    // Sanity: if system content actually changes, the header is expected to
-    // differ — this is NOT a bug; it reflects a different session.
+    // Sanity: under non-signing mode (cch derived from full payload), if system
+    // content actually changes, the header is expected to differ.
     a := []byte(`{"system":[{"type":"text","text":"A"}],"tools":[]}`)
     b := []byte(`{"system":[{"type":"text","text":"B"}],"tools":[]}`)
-    if generateBillingHeader(a, "") == generateBillingHeader(b, "") {
+    if generateBillingHeader(a, false, "2.1.63", "A", "cli", "") == generateBillingHeader(b, false, "2.1.63", "B", "cli", "") {
         t.Fatalf("billing header should differ when system content differs")
     }
 }
 
-func TestGenerateBillingHeader_DefaultVersion(t *testing.T) {
-    // When version is empty, fall back to the hardcoded default.
-    out := generateBillingHeader([]byte(`{}`), "")
-    if !strings.Contains(out, "cc_version=2.1.63.") {
-        t.Fatalf("expected default version 2.1.63, got %s", out)
+func TestGenerateBillingHeader_DefaultEntrypoint(t *testing.T) {
+    // When entrypoint is empty, fall back to "cli".
+    out := generateBillingHeader([]byte(`{}`), false, "2.1.63", "msg", "", "")
+    if !strings.Contains(out, "cc_entrypoint=cli;") {
+        t.Fatalf("expected default entrypoint cli, got %s", out)
     }
 }
 

@@ -7,9 +7,10 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
-	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	"github.com/tidwall/gjson"
 )
 
 func newResponsesStreamTestHandler(t *testing.T) (*OpenAIResponsesAPIHandler, *httptest.ResponseRecorder, *gin.Context, http.Flusher) {
@@ -41,7 +42,7 @@ func TestForwardResponsesStreamSeparatesDataOnlySSEChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, nil, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 	body := recorder.Body.String()
 	parts := strings.Split(strings.TrimSpace(body), "\n\n")
 	if len(parts) != 2 {
@@ -53,9 +54,105 @@ func TestForwardResponsesStreamSeparatesDataOnlySSEChunks(t *testing.T) {
 		t.Errorf("unexpected first event.\nGot: %q\nWant: %q", parts[0], expectedPart1)
 	}
 
-	expectedPart2 := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}"
+	expectedPart2 := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[{\"type\":\"function_call\",\"arguments\":\"{}\"}]}}"
 	if parts[1] != expectedPart2 {
 		t.Errorf("unexpected second event.\nGot: %q\nWant: %q", parts[1], expectedPart2)
+	}
+}
+
+func TestForwardResponsesStreamRepairsEmptyCompletedOutputFromDoneItems(t *testing.T) {
+	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
+
+	data := make(chan []byte, 3)
+	errs := make(chan *interfaces.ErrorMessage)
+	data <- []byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs-1","summary":[]}}`)
+	data <- []byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"shell","arguments":"{\"cmd\":\"pwd\"}","status":"completed"}}`)
+	data <- []byte(`data: {"type":"response.completed","response":{"id":"resp-1","output":[]}}`)
+	close(data)
+	close(errs)
+
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+
+	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 SSE events, got %d. Body: %q", len(parts), recorder.Body.String())
+	}
+
+	payload := strings.TrimPrefix(parts[2], "data: ")
+	output := gjson.Get(payload, "response.output")
+	if !output.IsArray() || len(output.Array()) != 2 {
+		t.Fatalf("expected repaired completed output with 2 items, got %s", output.Raw)
+	}
+	if got := gjson.Get(payload, "response.output.1.name").String(); got != "shell" {
+		t.Fatalf("expected function_call name to be preserved, got %q in %s", got, payload)
+	}
+	if got := gjson.Get(payload, "response.output.1.arguments").String(); got != `{"cmd":"pwd"}` {
+		t.Fatalf("expected function_call arguments to be preserved, got %q in %s", got, payload)
+	}
+}
+
+func TestForwardResponsesStreamRepairsMixedIndexedAndUnindexedDoneItems(t *testing.T) {
+	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
+
+	data := make(chan []byte, 3)
+	errs := make(chan *interfaces.ErrorMessage)
+	data <- []byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"shell","arguments":"{}","status":"completed"}}`)
+	data <- []byte(`data: {"type":"response.output_item.done","item":{"type":"message","id":"msg-1","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`)
+	data <- []byte(`data: {"type":"response.completed","response":{"id":"resp-1","output":[]}}`)
+	close(data)
+	close(errs)
+
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+
+	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 SSE events, got %d. Body: %q", len(parts), recorder.Body.String())
+	}
+
+	payload := strings.TrimPrefix(parts[2], "data: ")
+	output := gjson.Get(payload, "response.output")
+	if !output.IsArray() || len(output.Array()) != 2 {
+		t.Fatalf("expected repaired completed output with 2 items, got %s", output.Raw)
+	}
+	if got := gjson.Get(payload, "response.output.0.name").String(); got != "shell" {
+		t.Fatalf("expected indexed function_call to be preserved first, got %q in %s", got, payload)
+	}
+	if got := gjson.Get(payload, "response.output.1.id").String(); got != "msg-1" {
+		t.Fatalf("expected unindexed message to be appended, got %q in %s", got, payload)
+	}
+}
+
+func TestForwardResponsesStreamRepairsMultilineCompletedOutputAsSSEDataLines(t *testing.T) {
+	h, recorder, c, flusher := newResponsesStreamTestHandler(t)
+
+	data := make(chan []byte, 2)
+	errs := make(chan *interfaces.ErrorMessage)
+	data <- []byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","arguments":"{}"}}`)
+	data <- []byte("data: {\"type\":\"response.completed\",\ndata: \"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n")
+	close(data)
+	close(errs)
+
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
+
+	parts := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n\n")
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 SSE events, got %d. Body: %q", len(parts), recorder.Body.String())
+	}
+
+	completedFrame := []byte(parts[1])
+	for _, line := range strings.Split(parts[1], "\n") {
+		if line != "" && !strings.HasPrefix(line, "data: ") {
+			t.Fatalf("expected every completed payload line to be an SSE data line, got %q in %q", line, parts[1])
+		}
+	}
+
+	payload, ok := responsesSSEDataPayload(completedFrame)
+	if !ok {
+		t.Fatalf("expected completed frame to contain data payload: %q", parts[1])
+	}
+	output := gjson.GetBytes(payload, "response.output")
+	if !output.IsArray() || len(output.Array()) != 1 {
+		t.Fatalf("expected repaired completed output with 1 item, got %s from %q", output.Raw, payload)
 	}
 }
 
@@ -70,7 +167,7 @@ func TestForwardResponsesStreamReassemblesSplitSSEEventChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, nil, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 
 	got := strings.TrimSuffix(recorder.Body.String(), "\n")
 	want := "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n"
@@ -89,7 +186,7 @@ func TestForwardResponsesStreamPreservesValidFullSSEEventChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, nil, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 
 	got := strings.TrimSuffix(recorder.Body.String(), "\n")
 	if got != string(chunk) {
@@ -107,7 +204,7 @@ func TestForwardResponsesStreamBuffersSplitDataPayloadChunks(t *testing.T) {
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, nil, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 
 	got := recorder.Body.String()
 	want := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n\n"
@@ -134,7 +231,7 @@ func TestForwardResponsesStreamDropsIncompleteTrailingDataChunkOnFlush(t *testin
 	close(data)
 	close(errs)
 
-	h.forwardResponsesStream(c, flusher, func(error) {}, nil, data, errs, nil)
+	h.forwardResponsesStream(c, flusher, func(error) {}, data, errs, nil)
 
 	if got := recorder.Body.String(); got != "\n" {
 		t.Fatalf("expected incomplete trailing data to be dropped on flush.\nGot: %q", got)

@@ -5,13 +5,11 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-func TestNewAntigravityHTTPClientReusesSharedEnvironmentProxyTransport(t *testing.T) {
-	setEnvironmentProxy(t, "http://env-proxy.example.com:8080")
-
+func TestNewAntigravityHTTPClientReusesSharedHTTP11Transport(t *testing.T) {
 	clientA := newAntigravityHTTPClient(context.Background(), &config.Config{}, &cliproxyauth.Auth{}, 0)
 	clientB := newAntigravityHTTPClient(context.Background(), &config.Config{}, &cliproxyauth.Auth{}, 0)
 
@@ -25,12 +23,15 @@ func TestNewAntigravityHTTPClientReusesSharedEnvironmentProxyTransport(t *testin
 	}
 
 	if transportA != transportB {
-		t.Fatal("expected Antigravity environment proxy transport to be shared across clients")
-	}
-	if transportA == newEnvironmentProxyTransport() {
-		t.Fatal("expected Antigravity transport to use its HTTP/1.1 clone, not the generic environment proxy transport")
+		t.Fatal("expected Antigravity HTTP/1.1 transport to be shared across clients")
 	}
 	if transportA.ForceAttemptHTTP2 {
 		t.Fatal("expected Antigravity transport to keep HTTP/2 disabled")
+	}
+	if transportA.TLSNextProto == nil {
+		t.Fatal("expected Antigravity transport to disable HTTP/2 TLSNextProto")
+	}
+	if transportA.TLSClientConfig == nil || len(transportA.TLSClientConfig.NextProtos) != 1 || transportA.TLSClientConfig.NextProtos[0] != "http/1.1" {
+		t.Fatalf("expected Antigravity transport to force HTTP/1.1 ALPN, got %#v", transportA.TLSClientConfig)
 	}
 }

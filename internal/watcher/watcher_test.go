@@ -14,11 +14,11 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/diff"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
-	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -70,6 +70,7 @@ func TestBuildAPIKeyClientsCounts(t *testing.T) {
 		CodexKey:  []config.CodexKey{{APIKey: "x1"}, {APIKey: "x2"}},
 		OpenAICompatibility: []config.OpenAICompatibility{
 			{APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "o1"}, {APIKey: "o2"}}},
+			{Disabled: true, APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "disabled"}}},
 		},
 	}
 
@@ -997,6 +998,49 @@ func TestHandleEventAuthWriteTriggersUpdate(t *testing.T) {
 	w.handleEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Write})
 	if atomic.LoadInt32(&reloads) != 0 {
 		t.Fatalf("expected auth write to avoid global reload callback, got %d", reloads)
+	}
+}
+
+func TestHandleEventIgnoresAuthJSONOutsideWatchedDirWithSharedPrefix(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	authSiblingDir := filepath.Join(tmpDir, "auth-bak")
+	if err := os.MkdirAll(authSiblingDir, 0o755); err != nil {
+		t.Fatalf("failed to create sibling auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth_dir: "+authDir+"\n"), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+	authFile := filepath.Join(authSiblingDir, "outside.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"demo"}`), 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	var reloads int32
+	w := &Watcher{
+		authDir:        authDir,
+		configPath:     configPath,
+		lastAuthHashes: make(map[string]string),
+		reloadCallback: func(*config.Config) { atomic.AddInt32(&reloads, 1) },
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	defer w.stopPendingAuthWrites()
+
+	w.handleEvent(fsnotify.Event{Name: authFile, Op: fsnotify.Write})
+
+	time.Sleep(authWriteDebounceWindow + 100*time.Millisecond)
+	if atomic.LoadInt32(&reloads) != 0 {
+		t.Fatalf("expected no reloads for auth json outside watched dir, got %d", reloads)
+	}
+	w.eventMu.Lock()
+	pending := len(w.pendingAuthWrites)
+	w.eventMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("expected no pending auth writes for sibling dir event, got %d", pending)
 	}
 }
 

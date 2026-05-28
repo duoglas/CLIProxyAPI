@@ -14,15 +14,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	"golang.org/x/net/context"
 )
 
@@ -56,6 +55,7 @@ const (
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+type disallowFreeAuthContextKey struct{}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -90,6 +90,14 @@ func WithExecutionSessionID(ctx context.Context, sessionID string) context.Conte
 		ctx = context.Background()
 	}
 	return context.WithValue(ctx, executionSessionContextKey{}, sessionID)
+}
+
+// WithDisallowFreeAuth returns a child context that requests skipping known free-tier credentials.
+func WithDisallowFreeAuth(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, disallowFreeAuthContextKey{}, true)
 }
 
 // BuildErrorResponseBody builds an OpenAI-compatible JSON error response body.
@@ -188,18 +196,26 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 
 func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
-	// It is forwarded as execution metadata; when absent we generate a UUID.
+	// Only include it if the client explicitly provides it.
 	key := ""
+	requestPath := ""
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
+			requestPath = strings.TrimSpace(ginCtx.FullPath())
+			if requestPath == "" && ginCtx.Request.URL != nil {
+				requestPath = strings.TrimSpace(ginCtx.Request.URL.Path)
+			}
 		}
 	}
-	if key == "" {
-		key = uuid.NewString()
-	}
 
-	meta := map[string]any{idempotencyKeyMetadataKey: key}
+	meta := make(map[string]any)
+	if key != "" {
+		meta[idempotencyKeyMetadataKey] = key
+	}
+	if requestPath != "" {
+		meta[coreexecutor.RequestPathMetadataKey] = requestPath
+	}
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
@@ -209,7 +225,23 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
+	if disallowFreeAuthFromContext(ctx) {
+		meta[coreexecutor.DisallowFreeAuthMetadataKey] = true
+	}
 	return meta
+}
+
+// headersFromContext extracts the original HTTP request headers from the gin context
+// embedded in the provided context. This allows session affinity selectors to read
+// client headers like X-Amp-Thread-Id.
+func headersFromContext(ctx context.Context) http.Header {
+	if ctx == nil {
+		return nil
+	}
+	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+		return ginCtx.Request.Header.Clone()
+	}
+	return nil
 }
 
 func pinnedAuthIDFromContext(ctx context.Context) string {
@@ -251,6 +283,14 @@ func executionSessionIDFromContext(ctx context.Context) string {
 	default:
 		return ""
 	}
+}
+
+func disallowFreeAuthFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	raw, ok := ctx.Value(disallowFreeAuthContextKey{}).(bool)
+	return ok && raw
 }
 
 // BaseAPIHandler contains the handlers for API endpoints.
@@ -335,13 +375,34 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	if requestCtx != nil && logging.GetRequestID(parentCtx) == "" {
 		if requestID := logging.GetRequestID(requestCtx); requestID != "" {
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
-		} else if requestID := logging.GetGinRequestID(c); requestID != "" {
+		} else if requestID = logging.GetGinRequestID(c); requestID != "" {
 			parentCtx = logging.WithRequestID(parentCtx, requestID)
 		}
 	}
-	baseCtx, cancel := context.WithCancel(parentCtx)
+	newCtx, cancel := context.WithCancel(parentCtx)
+
+	endpoint := ""
+	if c != nil && c.Request != nil {
+		path := strings.TrimSpace(c.FullPath())
+		if path == "" && c.Request.URL != nil {
+			path = strings.TrimSpace(c.Request.URL.Path)
+		}
+		if path != "" {
+			method := strings.TrimSpace(c.Request.Method)
+			if method != "" {
+				endpoint = method + " " + path
+			} else {
+				endpoint = path
+			}
+		}
+	}
+	if endpoint != "" {
+		newCtx = logging.WithEndpoint(newCtx, endpoint)
+	}
+	newCtx = logging.WithResponseStatusHolder(newCtx)
+
+	cancelCtx := newCtx
 	if requestCtx != nil && requestCtx != parentCtx {
-		cancelCtx := baseCtx
 		go func() {
 			select {
 			case <-requestCtx.Done():
@@ -350,9 +411,12 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			}
 		}()
 	}
-	newCtx := context.WithValue(baseCtx, "gin", c)
+	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	return newCtx, func(params ...interface{}) {
+		if c != nil {
+			logging.SetResponseStatus(cancelCtx, c.Writer.Status())
+		}
 		if h.Cfg.RequestLog && len(params) == 1 {
 			if existing, exists := c.Get("API_RESPONSE"); exists {
 				if existingBytes, ok := existing.([]byte); ok && len(bytes.TrimSpace(existingBytes)) > 0 {
@@ -475,7 +539,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -489,15 +553,15 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
+		err = enrichAuthSelectionError(err, providers, normalizedModel)
+		status := statusFromError(err)
+		if status <= 0 {
+			status = http.StatusInternalServerError
 		}
 		var addon http.Header
 		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
@@ -521,7 +585,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		return nil, nil, errMsg
 	}
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -535,15 +599,15 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
-		status := http.StatusInternalServerError
-		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-			if code := se.StatusCode(); code > 0 {
-				status = code
-			}
+		err = enrichAuthSelectionError(err, providers, normalizedModel)
+		status := statusFromError(err)
+		if status <= 0 {
+			status = http.StatusInternalServerError
 		}
 		var addon http.Header
 		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
@@ -571,7 +635,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		return nil, nil, errChan
 	}
 	reqMeta := requestExecutionMetadata(ctx)
-	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
 	payload := rawJSON
 	if len(payload) == 0 {
 		payload = nil
@@ -585,31 +649,34 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         headersFromContext(ctx),
 	}
 	opts.Metadata = reqMeta
-	maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
-	streamResult, initialBootstrapRetries, err := h.executeStreamWithBootstrapRetry(ctx, providers, req, opts, maxBootstrapRetries)
+	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
-		if shouldWrapImmediateStreamError(err) {
-			streamResult = streamResultFromError(err)
-		} else {
-			errChan := make(chan *interfaces.ErrorMessage, 1)
-			status := http.StatusInternalServerError
-			if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
-				if code := se.StatusCode(); code > 0 {
-					status = code
-				}
+		for bootstrapRetries := 0; bootstrapRetries < StreamingBootstrapRetries(h.Cfg) && streamBootstrapEligible(err); bootstrapRetries++ {
+			retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
+			if retryErr == nil {
+				streamResult = retryResult
+				err = nil
+				break
 			}
-			var addon http.Header
-			if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-				if hdr := he.Headers(); hdr != nil {
-					addon = hdr.Clone()
-				}
-			}
-			errChan <- &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
-			close(errChan)
-			return nil, nil, errChan
+			err = retryErr
 		}
+	}
+	if err != nil {
+		err = enrichAuthSelectionError(err, providers, normalizedModel)
+		status := statusFromError(err)
+		if status <= 0 {
+			status = http.StatusInternalServerError
+		}
+		var addon http.Header
+		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+			if hdr := he.Headers(); hdr != nil {
+				addon = hdr.Clone()
+			}
+		}
+		return streamErrorChannels(&interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon})
 	}
 	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
 	// Capture upstream headers from the initial connection synchronously before the goroutine starts.
@@ -628,7 +695,8 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		defer close(dataChan)
 		defer close(errChan)
 		sentPayload := false
-		bootstrapRetries := initialBootstrapRetries
+		bootstrapRetries := 0
+		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
 
 		sendErr := func(msg *interfaces.ErrorMessage) bool {
 			if ctx == nil {
@@ -678,7 +746,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					// Safe bootstrap recovery: if the upstream fails before any payload bytes are sent,
 					// retry a few times (to allow auth rotation / transient recovery) and then attempt model fallback.
 					if !sentPayload {
-						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
+						if bootstrapRetries < maxBootstrapRetries && streamBootstrapEligible(streamErr) {
 							bootstrapRetries++
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {
@@ -688,14 +756,13 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 								chunks = retryResult.Chunks
 								continue outer
 							}
-							streamErr = retryErr
+							streamErr = enrichAuthSelectionError(retryErr, providers, normalizedModel)
 						}
 					}
-					status := http.StatusInternalServerError
-					if se, ok := streamErr.(interface{ StatusCode() int }); ok && se != nil {
-						if code := se.StatusCode(); code > 0 {
-							status = code
-						}
+
+					status := statusFromError(streamErr)
+					if status <= 0 {
+						status = http.StatusInternalServerError
 					}
 					var addon http.Header
 					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
@@ -724,24 +791,185 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	return dataChan, upstreamHeaders, errChan
 }
 
-func (h *BaseAPIHandler) executeStreamWithBootstrapRetry(ctx context.Context, providers []string, req coreexecutor.Request, opts coreexecutor.Options, maxBootstrapRetries int) (*coreexecutor.StreamResult, int, error) {
-	bootstrapRetries := 0
-	for {
-		streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
-		if err == nil {
-			return streamResult, bootstrapRetries, nil
-		}
-		if ctx != nil && ctx.Err() != nil {
-			return nil, bootstrapRetries, ctx.Err()
-		}
-		if bootstrapRetries >= maxBootstrapRetries || !bootstrapEligible(err) {
-			return nil, bootstrapRetries, err
-		}
-		bootstrapRetries++
+func (h *BaseAPIHandler) ExecuteStreamWithAuthRouteModel(ctx context.Context, handlerType, modelName, routeModel string, rawJSON []byte, alt string) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	_, normalizedModel, errMsg := h.getRequestDetails(modelName)
+	if errMsg != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- errMsg
+		close(errChan)
+		return nil, nil, errChan
 	}
+	routeProviders, normalizedRouteModel, routeErr := h.getRouteRequestDetails(routeModel)
+	if routeErr != nil {
+		errChan := make(chan *interfaces.ErrorMessage, 1)
+		errChan <- routeErr
+		close(errChan)
+		return nil, nil, errChan
+	}
+	reqMeta := requestExecutionMetadata(ctx)
+	reqMeta[coreexecutor.RequestedModelMetadataKey] = modelName
+	payload := rawJSON
+	if len(payload) == 0 {
+		payload = nil
+	}
+	req := coreexecutor.Request{
+		Model:   normalizedModel,
+		Payload: payload,
+	}
+	opts := coreexecutor.Options{
+		Stream:          true,
+		Alt:             alt,
+		OriginalRequest: rawJSON,
+		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         headersFromContext(ctx),
+	}
+	opts.Metadata = reqMeta
+	streamResult, err := h.AuthManager.ExecuteStreamWithRouteModel(ctx, routeProviders, normalizedRouteModel, req, opts)
+	if err != nil {
+		for bootstrapRetries := 0; bootstrapRetries < StreamingBootstrapRetries(h.Cfg) && streamBootstrapEligible(err); bootstrapRetries++ {
+			retryResult, retryErr := h.AuthManager.ExecuteStreamWithRouteModel(ctx, routeProviders, normalizedRouteModel, req, opts)
+			if retryErr == nil {
+				streamResult = retryResult
+				err = nil
+				break
+			}
+			err = retryErr
+		}
+	}
+	if err != nil {
+		err = enrichAuthSelectionError(err, routeProviders, normalizedRouteModel)
+		status := statusFromError(err)
+		if status <= 0 {
+			status = http.StatusInternalServerError
+		}
+		var addon http.Header
+		if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
+			if hdr := he.Headers(); hdr != nil {
+				addon = hdr.Clone()
+			}
+		}
+		return streamErrorChannels(&interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon})
+	}
+
+	passthroughHeadersEnabled := PassthroughHeadersEnabled(h.Cfg)
+	var upstreamHeaders http.Header
+	if passthroughHeadersEnabled {
+		upstreamHeaders = cloneHeader(FilterUpstreamHeaders(streamResult.Headers))
+		if upstreamHeaders == nil {
+			upstreamHeaders = make(http.Header)
+		}
+	}
+	chunks := streamResult.Chunks
+	dataChan := make(chan []byte)
+	errChan := make(chan *interfaces.ErrorMessage, 1)
+	go func() {
+		defer close(dataChan)
+		defer close(errChan)
+		sentPayload := false
+		bootstrapRetries := 0
+		maxBootstrapRetries := StreamingBootstrapRetries(h.Cfg)
+
+		sendErr := func(msg *interfaces.ErrorMessage) bool {
+			if ctx == nil {
+				errChan <- msg
+				return true
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case errChan <- msg:
+				return true
+			}
+		}
+
+		sendData := func(chunk []byte) bool {
+			if ctx == nil {
+				dataChan <- chunk
+				return true
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case dataChan <- chunk:
+				return true
+			}
+		}
+
+	outer:
+		for {
+			for {
+				var chunk coreexecutor.StreamChunk
+				var ok bool
+				if ctx != nil {
+					select {
+					case <-ctx.Done():
+						return
+					case chunk, ok = <-chunks:
+					}
+				} else {
+					chunk, ok = <-chunks
+				}
+				if !ok {
+					return
+				}
+				if chunk.Err != nil {
+					streamErr := chunk.Err
+					if !sentPayload {
+						if bootstrapRetries < maxBootstrapRetries && streamBootstrapEligible(streamErr) {
+							bootstrapRetries++
+							retryResult, retryErr := h.AuthManager.ExecuteStreamWithRouteModel(ctx, routeProviders, normalizedRouteModel, req, opts)
+							if retryErr == nil {
+								if passthroughHeadersEnabled {
+									replaceHeader(upstreamHeaders, FilterUpstreamHeaders(retryResult.Headers))
+								}
+								chunks = retryResult.Chunks
+								continue outer
+							}
+							streamErr = enrichAuthSelectionError(retryErr, routeProviders, normalizedRouteModel)
+						}
+					}
+
+					status := statusFromError(streamErr)
+					if status <= 0 {
+						status = http.StatusInternalServerError
+					}
+					var addon http.Header
+					if he, ok := streamErr.(interface{ Headers() http.Header }); ok && he != nil {
+						if hdr := he.Headers(); hdr != nil {
+							addon = hdr.Clone()
+						}
+					}
+					_ = sendErr(&interfaces.ErrorMessage{StatusCode: status, Error: streamErr, Addon: addon})
+					return
+				}
+				if len(chunk.Payload) > 0 {
+					if handlerType == "openai-response" {
+						if err := validateSSEDataJSON(chunk.Payload); err != nil {
+							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
+							return
+						}
+					}
+					sentPayload = true
+					if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {
+						return
+					}
+				}
+			}
+		}
+	}()
+	return dataChan, upstreamHeaders, errChan
 }
 
-func bootstrapEligible(err error) bool {
+func streamErrorChannels(msg *interfaces.ErrorMessage) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+	dataChan := make(chan []byte)
+	close(dataChan)
+	errChan := make(chan *interfaces.ErrorMessage, 1)
+	errChan <- msg
+	close(errChan)
+	return dataChan, nil, errChan
+}
+
+func streamBootstrapEligible(err error) bool {
 	status := statusFromError(err)
 	if status == 0 {
 		return true
@@ -753,38 +981,6 @@ func bootstrapEligible(err error) bool {
 	default:
 		return status >= http.StatusInternalServerError
 	}
-}
-
-func shouldWrapImmediateStreamError(err error) bool {
-	if err == nil {
-		return false
-	}
-	status := statusFromError(err)
-	switch status {
-	case http.StatusBadRequest:
-		return !strings.Contains(err.Error(), "invalid_request_error")
-	case http.StatusUnprocessableEntity:
-		return false
-	}
-	var authErr *coreauth.Error
-	if errors.As(err, &authErr) && authErr != nil {
-		switch authErr.Code {
-		case "auth_not_found", "provider_not_found":
-			return false
-		}
-	}
-	return bootstrapEligible(err)
-}
-
-func streamResultFromError(err error) *coreexecutor.StreamResult {
-	errCh := make(chan coreexecutor.StreamChunk, 1)
-	errCh <- coreexecutor.StreamChunk{Err: err}
-	close(errCh)
-	var headers http.Header
-	if he, ok := err.(interface{ Headers() http.Header }); ok && he != nil {
-		headers = cloneHeader(FilterUpstreamHeaders(he.Headers()))
-	}
-	return &coreexecutor.StreamResult{Headers: headers, Chunks: errCh}
 }
 
 func validateSSEDataJSON(chunk []byte) error {
@@ -820,7 +1016,8 @@ func statusFromError(err error) int {
 	if err == nil {
 		return 0
 	}
-	if se, ok := err.(interface{ StatusCode() int }); ok && se != nil {
+	var se interface{ StatusCode() int }
+	if errors.As(err, &se) && se != nil {
 		if code := se.StatusCode(); code > 0 {
 			return code
 		}
@@ -832,18 +1029,37 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	resolvedModelName := modelName
 	initialSuffix := thinking.ParseSuffix(modelName)
 	if initialSuffix.ModelName == "auto" {
-		resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
-		if initialSuffix.HasSuffix {
-			resolvedModelName = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
+		if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+			resolvedModelName = modelName
 		} else {
-			resolvedModelName = resolvedBase
+			resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
+			if initialSuffix.HasSuffix {
+				resolvedModelName = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
+			} else {
+				resolvedModelName = resolvedBase
+			}
 		}
 	} else {
-		resolvedModelName = util.ResolveAutoModel(modelName)
+		if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+			resolvedModelName = modelName
+		} else {
+			resolvedModelName = util.ResolveAutoModel(modelName)
+		}
 	}
 
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)
+
+	if strings.EqualFold(baseModel, "gpt-image-2") {
+		return nil, "", &interfaces.ErrorMessage{
+			StatusCode: http.StatusServiceUnavailable,
+			Error:      fmt.Errorf("model %s is only supported on /v1/images/generations and /v1/images/edits", baseModel),
+		}
+	}
+
+	if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		return []string{"home"}, resolvedModelName, nil
+	}
 
 	providers = util.GetProviderName(baseModel)
 	// Fallback: if baseModel has no provider but differs from resolvedModelName,
@@ -861,6 +1077,43 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
+	return providers, resolvedModelName, nil
+}
+
+func (h *BaseAPIHandler) getRouteRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
+	resolvedModelName := modelName
+	initialSuffix := thinking.ParseSuffix(modelName)
+	if initialSuffix.ModelName == "auto" {
+		if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+			resolvedModelName = modelName
+		} else {
+			resolvedBase := util.ResolveAutoModel(initialSuffix.ModelName)
+			if initialSuffix.HasSuffix {
+				resolvedModelName = fmt.Sprintf("%s(%s)", resolvedBase, initialSuffix.RawSuffix)
+			} else {
+				resolvedModelName = resolvedBase
+			}
+		}
+	} else if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		resolvedModelName = modelName
+	} else {
+		resolvedModelName = util.ResolveAutoModel(modelName)
+	}
+
+	parsed := thinking.ParseSuffix(resolvedModelName)
+	baseModel := strings.TrimSpace(parsed.ModelName)
+
+	if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		return []string{"home"}, resolvedModelName, nil
+	}
+
+	providers = util.GetProviderName(baseModel)
+	if len(providers) == 0 && baseModel != resolvedModelName {
+		providers = util.GetProviderName(resolvedModelName)
+	}
+	if len(providers) == 0 {
+		return nil, "", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: fmt.Errorf("unknown provider for model %s", modelName)}
+	}
 	return providers, resolvedModelName, nil
 }
 
@@ -890,6 +1143,54 @@ func replaceHeader(dst http.Header, src http.Header) {
 	}
 	for key, values := range src {
 		dst[key] = append([]string(nil), values...)
+	}
+}
+
+func enrichAuthSelectionError(err error, providers []string, model string) error {
+	if err == nil {
+		return nil
+	}
+
+	var authErr *coreauth.Error
+	if !errors.As(err, &authErr) || authErr == nil {
+		return err
+	}
+
+	code := strings.TrimSpace(authErr.Code)
+	if code != "auth_not_found" && code != "auth_unavailable" {
+		return err
+	}
+
+	providerText := strings.Join(providers, ",")
+	if providerText == "" {
+		providerText = "unknown"
+	}
+	modelText := strings.TrimSpace(model)
+	if modelText == "" {
+		modelText = "unknown"
+	}
+
+	baseMessage := strings.TrimSpace(authErr.Message)
+	if baseMessage == "" {
+		baseMessage = "no auth available"
+	}
+	detail := fmt.Sprintf("%s (providers=%s, model=%s)", baseMessage, providerText, modelText)
+
+	// Clarify the most common alias confusion between Anthropic route names and internal provider keys.
+	if strings.Contains(","+providerText+",", ",claude,") {
+		detail += "; check Claude auth/key session and cooldown state via /v0/management/auth-files"
+	}
+
+	status := authErr.HTTPStatus
+	if status <= 0 {
+		status = http.StatusServiceUnavailable
+	}
+
+	return &coreauth.Error{
+		Code:       authErr.Code,
+		Message:    detail,
+		Retryable:  authErr.Retryable,
+		HTTPStatus: status,
 	}
 }
 

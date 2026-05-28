@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 // FileSynthesizer generates Auth entries from OAuth JSON files.
@@ -157,6 +157,7 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	coreauth.ApplyCustomHeadersFromMetadata(a)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
@@ -232,6 +233,11 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 		// Propagate note from primary auth to virtual auths
 		if noteVal, hasNote := primary.Attributes["note"]; hasNote && noteVal != "" {
 			attrs["note"] = noteVal
+		}
+		for k, v := range primary.Attributes {
+			if strings.HasPrefix(k, "header:") && strings.TrimSpace(v) != "" {
+				attrs[k] = v
+			}
 		}
 		metadataCopy := map[string]any{
 			"email":             email,

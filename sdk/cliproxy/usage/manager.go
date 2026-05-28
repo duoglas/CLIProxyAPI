@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,23 +13,64 @@ import (
 type Record struct {
 	Provider    string
 	Model       string
+	Alias       string
 	APIKey      string
 	AuthID      string
 	AuthIndex   string
+	AuthType    string
 	Source      string
 	RequestedAt time.Time
 	Latency     time.Duration
 	Failed      bool
+	Fail        Failure
 	Detail      Detail
+}
+
+// Failure holds HTTP failure metadata for an upstream request attempt.
+type Failure struct {
+	StatusCode int
+	Body       string
 }
 
 // Detail holds the token usage breakdown.
 type Detail struct {
-	InputTokens     int64
-	OutputTokens    int64
-	ReasoningTokens int64
-	CachedTokens    int64
-	TotalTokens     int64
+	InputTokens         int64
+	OutputTokens        int64
+	ReasoningTokens     int64
+	CachedTokens        int64
+	CacheReadTokens     int64
+	CacheCreationTokens int64
+	TotalTokens         int64
+}
+
+type requestedModelAliasContextKey struct{}
+
+// WithRequestedModelAlias stores the client-requested model name for usage sinks.
+func WithRequestedModelAlias(ctx context.Context, alias string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestedModelAliasContextKey{}, alias)
+}
+
+// RequestedModelAliasFromContext returns the client-requested model name stored in ctx.
+func RequestedModelAliasFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	raw := ctx.Value(requestedModelAliasContextKey{})
+	switch value := raw.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []byte:
+		return strings.TrimSpace(string(value))
+	default:
+		return ""
+	}
 }
 
 // Plugin consumes usage records emitted by the proxy runtime.
@@ -43,6 +85,7 @@ type queueItem struct {
 
 // Manager maintains a queue of usage records and delivers them to registered plugins.
 type Manager struct {
+	buffer   int
 	once     sync.Once
 	stopOnce sync.Once
 	cancel   context.CancelFunc
@@ -58,7 +101,11 @@ type Manager struct {
 
 // NewManager constructs a manager with a buffered queue.
 func NewManager(buffer int) *Manager {
+	if buffer <= 0 {
+		buffer = 512
+	}
 	m := &Manager{}
+	m.buffer = buffer
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
@@ -117,12 +164,30 @@ func (m *Manager) Publish(ctx context.Context, record Record) {
 		m.mu.Unlock()
 		return
 	}
+	if m.buffer > 0 && len(m.queue) >= m.buffer {
+		copy(m.queue, m.queue[1:])
+		m.queue[len(m.queue)-1] = queueItem{}
+		m.queue = m.queue[:len(m.queue)-1]
+	}
 	m.queue = append(m.queue, queueItem{ctx: ctx, record: record})
 	m.mu.Unlock()
 	m.cond.Signal()
 }
 
 func (m *Manager) run(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			m.mu.Lock()
+			m.closed = true
+			m.mu.Unlock()
+			m.cond.Broadcast()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
 	for {
 		m.mu.Lock()
 		for !m.closed && len(m.queue) == 0 {
