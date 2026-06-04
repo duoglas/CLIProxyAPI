@@ -639,6 +639,68 @@ func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.
 	}
 }
 
+func TestManager_CodexRequestScopedStreamDisconnect408DoesNotCooldownAuth(t *testing.T) {
+	model := "gpt-5.4-mini"
+	executor := &authFallbackExecutor{
+		id: "codex",
+		executeErrors: map[string]error{
+			"codex-auth": &Error{
+				HTTPStatus: http.StatusRequestTimeout,
+				Message:    "codex /v1/responses stream disconnected before response.completed",
+			},
+		},
+	}
+
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(1, 0, 1, 1)
+	m.RegisterExecutor(executor)
+
+	reg := registry.GetGlobalRegistry()
+	auth := &Auth{ID: "codex-auth", Provider: "codex"}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register codex auth: %v", errRegister)
+	}
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	_, errExecute := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute == nil {
+		t.Fatal("expected request-scoped codex 408 error")
+	}
+	errResult, ok := errExecute.(*Error)
+	if !ok {
+		t.Fatalf("expected *Error, got %T", errExecute)
+	}
+	if errResult.HTTPStatus != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want %d", errResult.HTTPStatus, http.StatusRequestTimeout)
+	}
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected codex auth to remain registered")
+	}
+	if updated.Unavailable {
+		t.Fatalf("expected codex stream-disconnect 408 to keep auth available")
+	}
+	if !updated.NextRetryAfter.IsZero() {
+		t.Fatalf("expected codex stream-disconnect 408 to keep auth cooldown unset, got %v", updated.NextRetryAfter)
+	}
+	if state := updated.ModelStates[model]; state != nil {
+		t.Fatalf("expected codex stream-disconnect 408 to avoid model cooldown state, got %#v", state)
+	}
+
+	delete(executor.executeErrors, auth.ID)
+	resp, errRetry := m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errRetry != nil {
+		t.Fatalf("expected later selection to reuse codex auth instead of auth_unavailable/model_cooldown, got %T %v", errRetry, errRetry)
+	}
+	if string(resp.Payload) != auth.ID {
+		t.Fatalf("retry response payload = %q, want %q", string(resp.Payload), auth.ID)
+	}
+}
+
 func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing.T) {
 	model := "test-model-request-scoped-not-found"
 	executor := &authFallbackExecutor{

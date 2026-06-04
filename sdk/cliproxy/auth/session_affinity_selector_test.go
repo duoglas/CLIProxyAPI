@@ -167,7 +167,10 @@ func TestSessionAffinitySelector_CodexWebsocketRebindsFromHTTPBindingToWebsocket
 		{ID: "codex-ws", Provider: "codex", Attributes: map[string]string{"websockets": "true"}},
 	}
 
-	first, err := selector.Pick(context.Background(), "codex", "gpt-5.4", opts, auths)
+	// Deterministically bind the session to the non-websocket http auth by
+	// narrowing the initial candidate set to only codex-http (C-ARCH-02: do not
+	// rely on the randomized selector returning a specific instance first).
+	first, err := selector.Pick(context.Background(), "codex", "gpt-5.4", opts, auths[:1])
 	if err != nil {
 		t.Fatalf("Pick() initial error = %v", err)
 	}

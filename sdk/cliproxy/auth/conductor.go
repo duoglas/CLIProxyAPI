@@ -1915,7 +1915,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		} else {
 			if result.Model != "" {
-				if !isRequestScopedNotFoundResultError(result.Error) {
+				if !isRequestScopedResultError(result.Provider, result.Error) {
 					state := ensureModelState(auth, result.Model)
 					state.Unavailable = true
 					state.Status = StatusError
@@ -2303,6 +2303,24 @@ func isRequestScopedNotFoundResultError(err *Error) bool {
 		return false
 	}
 	return statusCodeFromResult(err) == http.StatusNotFound && isRequestScopedNotFoundMessage(err.Message)
+}
+
+func isRequestScopedCodexStreamDisconnectResultError(provider string, err *Error) bool {
+	if err == nil || !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return false
+	}
+	if statusCodeFromResult(err) != http.StatusRequestTimeout {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Message))
+	return strings.Contains(message, "/v1/responses") &&
+		strings.Contains(message, "stream") &&
+		strings.Contains(message, "disconnect") &&
+		strings.Contains(message, "response.completed")
+}
+
+func isRequestScopedResultError(provider string, err *Error) bool {
+	return isRequestScopedNotFoundResultError(err) || isRequestScopedCodexStreamDisconnectResultError(provider, err)
 }
 
 // isRequestInvalidError returns true if the error represents a caller-side
