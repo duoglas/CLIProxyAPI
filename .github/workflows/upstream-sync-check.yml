@@ -1,5 +1,14 @@
 name: Upstream Sync Check
 
+# 上游真正源头是 router-for-me/CLIProxyAPI。
+# 原 fork 源 Arron196/CLIProxyAPI 已于 2026-06-01 被归档(read-only, 停更),
+# 故本 workflow 改为直接盯 router-for-me。
+#
+# 注意: 本仓库是深度定制 fork(反检测加固 + Auth Guard 等), 相对 router-for-me
+# 长期 behind 数百 commit, 不会做全量 merge。因此监控的是 router-for-me 的
+# release 节奏(规律发版), 仅在其发布新 release 时通知一次, 提示选择性 backport,
+# 而不是按 commit behind 数刷屏。
+
 on:
   schedule:
     - cron: '23 8 * * *'  # 每天 UTC 08:23 (北京 16:23)
@@ -9,34 +18,29 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check upstream commits
+      - name: Check router-for-me latest release
         id: upstream
         run: |
-          git remote add upstream https://github.com/Arron196/CLIProxyAPI.git 2>/dev/null || true
-          git fetch upstream main --quiet
+          REL=$(curl -sf https://api.github.com/repos/router-for-me/CLIProxyAPI/releases/latest)
+          TAG=$(echo "$REL" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)
+          PUB=$(echo "$REL" | grep -o '"published_at":"[^"]*"' | head -1 | cut -d'"' -f4)
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "published=$PUB" >> $GITHUB_OUTPUT
 
-          LOCAL=$(git rev-parse HEAD)
-          UPSTREAM=$(git rev-parse upstream/main)
-          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          NOW=$(date -u +%s)
+          PUB_TS=$(date -u -d "$PUB" +%s 2>/dev/null || echo 0)
+          AGE=$(( NOW - PUB_TS ))
 
-          echo "local=$LOCAL" >> $GITHUB_OUTPUT
-          echo "upstream=$UPSTREAM" >> $GITHUB_OUTPUT
-          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          echo "## router-for-me latest release: \`$TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "- published: $PUB" >> $GITHUB_STEP_SUMMARY
 
-          if [ "$BEHIND" -gt 0 ]; then
+          # 90000s ≈ 25h, 覆盖每日 cron 周期 + 余量; 只有过去一天内发布的新 release 才通知
+          if [ "$PUB_TS" -gt 0 ] && [ "$AGE" -lt 90000 ]; then
             echo "needs_sync=true" >> $GITHUB_OUTPUT
-            COMMITS=$(git log --oneline HEAD..upstream/main | head -10)
-            echo "## Upstream has $BEHIND new commit(s)" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "$COMMITS" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "- → 过去 25h 内发布了新 release, 触发通知" >> $GITHUB_STEP_SUMMARY
           else
             echo "needs_sync=false" >> $GITHUB_OUTPUT
-            echo "## Up to date with upstream" >> $GITHUB_STEP_SUMMARY
+            echo "- → 无新 release" >> $GITHUB_STEP_SUMMARY
           fi
 
       - name: Check Claude Code versions
@@ -51,23 +55,23 @@ jobs:
           echo "- CLI: $CLI_VER" >> $GITHUB_STEP_SUMMARY
           echo "- SDK: $SDK_VER" >> $GITHUB_STEP_SUMMARY
 
-      - name: Notify via Telegram if upstream needs sync
+      - name: Notify via Telegram on new upstream release
         if: steps.upstream.outputs.needs_sync == 'true'
         env:
           TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT_ID }}
         run: |
-          BEHIND=${{ steps.upstream.outputs.behind }}
+          TAG=${{ steps.upstream.outputs.tag }}
           CLI=${{ steps.versions.outputs.cli }}
           SDK=${{ steps.versions.outputs.sdk }}
 
-          TEXT="📦 *CPA 上游有 ${BEHIND} 个新 commit*
+          TEXT="📦 *router-for-me 发布新版 ${TAG}*
+（Arron196 已归档，现盯真正源头）
 
-当前版本: CLI \`${CLI}\`, SDK \`${SDK}\`
+当前 Claude Code: CLI \`${CLI}\`, SDK \`${SDK}\`
 
-\`\`\`
-cd my-cpa && git fetch upstream && git merge upstream/main && ./build.sh deploy
-\`\`\`"
+⚠️ 本仓库是深度定制 fork，*不要*全量 merge。请 review 新 release 的关键修复（尤其 claude_executor / selector / auth / conductor），选择性 backport：
+https://github.com/router-for-me/CLIProxyAPI/releases/tag/${TAG}"
 
           curl -sf -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -d chat_id="${TG_CHAT}" \
