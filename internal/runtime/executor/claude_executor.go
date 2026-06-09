@@ -634,9 +634,10 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
-	if !strings.HasPrefix(baseModel, "claude-3-5-haiku") {
-		body = checkSystemInstructions(body)
-	}
+	// Anti-detection invariant: do NOT skip Haiku models here. Haiku must receive
+	// the same system-instruction cloaking as every other Claude model, otherwise
+	// the per-model behavioral difference is itself a detectable fingerprint.
+	body = checkSystemInstructions(body)
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
 	body = enforceCacheControlLimit(body, 4)
@@ -1034,7 +1035,10 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if isAnthropicBase {
 		misc.EnsureHeader(r.Header, ginHeaders, "x-client-request-id", uuid.New().String())
 	}
-	r.Header.Set("Connection", "keep-alive")
+	// Anti-detection: do not send a Connection header. It is a hop-by-hop header
+	// that is irrelevant over HTTP/2, and real first-party Claude Code clients do
+	// not emit it; setting "keep-alive" would be a detectable proxy fingerprint.
+	r.Header.Del("Connection")
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
 		// SSE streams must not be compressed: the downstream scanner reads
@@ -1863,13 +1867,13 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		return payload
 	}
 
-	// Skip system instructions for claude-3-5-haiku models
-	if !strings.HasPrefix(model, "claude-3-5-haiku") {
-		billingVersion := helps.DefaultClaudeVersion(cfg)
-		entrypoint := parseEntrypointFromUA(clientUserAgent)
-		workload := getWorkloadFromContext(ctx)
-		payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
-	}
+	// Anti-detection invariant: apply system-instruction cloaking to Haiku models
+	// as well. Skipping Haiku would leave a per-model behavioral difference that is
+	// itself a detectable fingerprint.
+	billingVersion := helps.DefaultClaudeVersion(cfg)
+	entrypoint := parseEntrypointFromUA(clientUserAgent)
+	workload := getWorkloadFromContext(ctx)
+	payload = checkSystemInstructionsWithSigningMode(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload)
 
 	// Inject fake user ID
 	payload = injectFakeUserID(payload, apiKey, cacheUserID)
