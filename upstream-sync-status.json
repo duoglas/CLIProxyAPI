@@ -5,25 +5,19 @@
   "latest_checked_commit": "8c2bf2c24baa8e1268a5f8e5313d84988429e42c",
   "checked_at": "2026-07-11",
   "baseline": "rebase/v7.2.65",
-  "note": "Rebased fork onto upstream v7.2.65 (from v7.1.56). Fork-unique content re-applied on top: anti-detection hardening (3 changes) + ops/Dockerfile tooling. Upstream ships device-profile/uTLS/session-affinity/config-driven billing version natively.",
-  "fork_unique_commits": [
+  "note": "Rebased fork onto upstream v7.2.65 (from v7.1.56). Only fork-unique content kept: provider-agnostic connection-pool isolation + ops/Dockerfile tooling. Claude-specific cloaking dropped (CPA no longer serves Claude). Upstream ships device-profile/uTLS/session-affinity/config-driven billing version natively.",
+  "fork_unique_changes": [
     {
-      "local_commit": "9fdb8d76",
-      "subject": "feat(executor): re-apply anti-detection hardening",
-      "files": [
-        "internal/runtime/executor/claude_executor.go",
-        "sdk/cliproxy/rtprovider.go"
-      ],
-      "changes": [
-        "Remove both claude-3-5-haiku skip guards so haiku is cloaked like other models",
-        "Strip Connection header on Claude requests (Del instead of Set keep-alive)",
-        "Per-credential connection pool isolation in rtprovider (cache key auth.ID + proxy) with TOCTOU double-check"
-      ]
+      "file": "sdk/cliproxy/rtprovider.go",
+      "change": "Per-credential connection pool isolation (cache key auth.ID + proxy) with TOCTOU double-check; prevents HTTP/2 correlation across codex/gemini/antigravity accounts. Provider-agnostic.",
+      "commits": ["9fdb8d76 (added)", "355b4980 (Claude parts reverted, this part kept)"]
     },
     {
-      "local_commit": "fd9bb5ff",
-      "subject": "chore(ops): add build/deploy tooling and fork Dockerfile"
+      "file": "Dockerfile, build.sh, monitor/, .github/workflows/upstream-sync-check.yml",
+      "change": "China-friendly cross-compile image + build/deploy tooling + upstream-release notifier",
+      "commits": ["fd9bb5ff"]
     }
   ],
-  "incremental_review_hint": "Watch upstream router-for-me/CLIProxyAPI new releases. To review deltas since this sync point: git fetch upstream --tags && git log --oneline v7.2.65..upstream/main -- '**/claude_executor.go' '**/rtprovider.go' '**/helps/*.go'. Selective backport only — do NOT full merge."
+  "dropped": "Claude-only cloaking (haiku skip-guard removal + Connection header strip) removed in 355b4980 — CPA does not use Claude.",
+  "incremental_review_hint": "Watch upstream router-for-me/CLIProxyAPI new releases. To review deltas since this sync point: git fetch upstream --tags && git log --oneline v7.2.65..upstream/main -- '**/rtprovider.go'. Selective backport only — do NOT full merge."
 }
