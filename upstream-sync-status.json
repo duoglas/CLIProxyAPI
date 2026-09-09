@@ -1,23 +1,28 @@
 {
   "remote": "upstream",
   "branch": "main",
-  "latest_checked_tag": "v7.2.65",
-  "latest_checked_commit": "8c2bf2c24baa8e1268a5f8e5313d84988429e42c",
-  "checked_at": "2026-07-11",
-  "baseline": "rebase/v7.2.65",
-  "note": "Rebased fork onto upstream v7.2.65 (from v7.1.56). Only fork-unique content kept: provider-agnostic connection-pool isolation + ops/Dockerfile tooling. Claude-specific cloaking dropped (CPA no longer serves Claude). Upstream ships device-profile/uTLS/session-affinity/config-driven billing version natively.",
+  "latest_checked_tag": "v7.2.155",
+  "latest_checked_commit": "871d2d296c020b30d45db355556a8edc60fd2e5f",
+  "checked_at": "2026-09-09",
+  "baseline": "upgrade/v7.2.155",
+  "note": "Merged upstream v7.2.155 into upgrade/v7.2.120 (prod since 2026-08-06) -> upgrade/v7.2.155. Clean merge, fork-unique content unchanged: provider-agnostic connection-pool isolation (rtprovider.go) + ops/Dockerfile tooling. Upstream 120..155 highlights for our traffic: codex UA 0.145.0->0.153.3 (gpt-6-astra needs client >=0.153.0), codex usage_limit_reached scoped per credential + resets_at parsing, cooldown floor, optional stream-bootstrap-buffering (left off: nginx in front), gpt-6-astra max/ultra reasoning levels, antigravity fallback version 2.2.1->2.9.1, per-model quota cooldown no longer blocks credential, antigravity per-credential transport pooling (helps/transport_cache.go, independent of rtprovider). Model catalog itself is remote (router-for-me/models).",
   "fork_unique_changes": [
     {
       "file": "sdk/cliproxy/rtprovider.go",
       "change": "Per-credential connection pool isolation (cache key auth.ID + proxy) with TOCTOU double-check; prevents HTTP/2 correlation across codex/gemini/antigravity accounts. Provider-agnostic.",
-      "commits": ["9fdb8d76 (added)", "355b4980 (Claude parts reverted, this part kept)"]
+      "commits": [
+        "9fdb8d76 (added)",
+        "355b4980 (Claude parts reverted, this part kept)"
+      ]
     },
     {
       "file": "Dockerfile, build.sh, monitor/, .github/workflows/upstream-sync-check.yml",
       "change": "China-friendly cross-compile image + build/deploy tooling + upstream-release notifier",
-      "commits": ["fd9bb5ff"]
+      "commits": [
+        "fd9bb5ff"
+      ]
     }
   ],
   "dropped": "Claude-only cloaking (haiku skip-guard removal + Connection header strip) removed in 355b4980 — CPA does not use Claude.",
-  "incremental_review_hint": "Watch upstream router-for-me/CLIProxyAPI new releases. To review deltas since this sync point: git fetch upstream --tags && git log --oneline v7.2.65..upstream/main -- '**/rtprovider.go'. Selective backport only — do NOT full merge."
+  "incremental_review_hint": "Watch upstream router-for-me/CLIProxyAPI new releases. To review deltas since this sync point: git fetch upstream --tags && git log --oneline v7.2.155..upstream/main. Merge the new tag into a fresh upgrade/<tag> branch (fork diff is 6 files; rtprovider.go is the only code hunk)."
 }
