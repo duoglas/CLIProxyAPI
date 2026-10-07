@@ -1,11 +1,11 @@
 {
   "remote": "upstream",
   "branch": "main",
-  "latest_checked_tag": "v7.2.155",
-  "latest_checked_commit": "871d2d296c020b30d45db355556a8edc60fd2e5f",
-  "checked_at": "2026-09-09",
-  "baseline": "upgrade/v7.2.155",
-  "note": "Merged upstream v7.2.155 into upgrade/v7.2.120 (prod since 2026-08-06) -> upgrade/v7.2.155. Clean merge, fork-unique content unchanged: provider-agnostic connection-pool isolation (rtprovider.go) + ops/Dockerfile tooling. Upstream 120..155 highlights for our traffic: codex UA 0.145.0->0.153.3 (gpt-6-astra needs client >=0.153.0), codex usage_limit_reached scoped per credential + resets_at parsing, cooldown floor, optional stream-bootstrap-buffering (left off: nginx in front), gpt-6-astra max/ultra reasoning levels, antigravity fallback version 2.2.1->2.9.1, per-model quota cooldown no longer blocks credential, antigravity per-credential transport pooling (helps/transport_cache.go, independent of rtprovider). Model catalog itself is remote (router-for-me/models).",
+  "latest_checked_tag": "v7.3.20",
+  "latest_checked_commit": "ef9e71201e0ca72b03a540d9b6e0862f8c053347",
+  "checked_at": "2026-10-08",
+  "baseline": "upgrade/v7.3.20",
+  "note": "Merged upstream v7.3.20 into upgrade/v7.2.155 -> upgrade/v7.3.20 (prod since 2026-10-08, image cpa-hardened:v7.3.20-c694974c). Clean merge, tests pass, fork-unique content unchanged. Highlights 155..v7.3.20: invalid_grant creds unscheduled when disabled / exponential backoff when enabled; credential-scoped quota cooldown isolated from model quota state; codex ChatGPT routing hint, client 0.155.0, per-credential codex cloak disable, websocket duplex; antigravity tool-ID sanitizing + tool result adjacency + Session_id replay; new optional config trusted-proxies / discovery (off) / claude.model-level-cooling (off). go.mod adds zeroconf + miekg/dns.",
   "fork_unique_changes": [
     {
       "file": "sdk/cliproxy/rtprovider.go",
@@ -24,5 +24,5 @@
     }
   ],
   "dropped": "Claude-only cloaking (haiku skip-guard removal + Connection header strip) removed in 355b4980 — CPA does not use Claude.",
-  "incremental_review_hint": "Watch upstream router-for-me/CLIProxyAPI new releases. To review deltas since this sync point: git fetch upstream --tags && git log --oneline v7.2.155..upstream/main. Merge the new tag into a fresh upgrade/<tag> branch (fork diff is 6 files; rtprovider.go is the only code hunk)."
+  "incremental_review_hint": "Watch upstream router-for-me/CLIProxyAPI new releases. To review deltas since this sync point: git fetch upstream --tags && git log --oneline v7.3.20..upstream/main. Merge the new tag into a fresh upgrade/<tag> branch (fork diff is 6 files; rtprovider.go is the only code hunk)."
 }
